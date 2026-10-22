@@ -1,4 +1,4 @@
-# Agentic Adaptive RAG
+# Agentic Adaptive RAG  
 
 > A production-oriented Agentic RAG system built with LangGraph that dynamically routes queries between local knowledge retrieval and web search, validates retrieval and generated answers, detects hallucinations, applies security controls, and provides evaluation and observability.
 
