@@ -1,891 +1,458 @@
-# Agentic Adaptive RAG  
+# RAG with Image Understanding
 
-> A production-oriented Agentic RAG system built with LangGraph that dynamically routes queries between local knowledge retrieval and web search, validates retrieval and generated answers, detects hallucinations, applies security controls, and provides evaluation and observability.
+An AI-powered application that combines **Retrieval-Augmented Generation (RAG), agentic workflows, document intelligence, and multimodal image understanding** in a unified web application.
 
+The system is designed to answer questions using relevant document context, analyze uploaded images, explain visual content, and provide a structured workflow for retrieval, generation, response evaluation, and security. It includes a web interface, a FastAPI backend, evaluation tools, and observability components.
+
+**Repository:** [RAG-with-Image-Understanding](https://github.com/Ruthvik2910/RAG-with-Image-Understanding)
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Key Features](#key-features)
+- [System Architecture](#system-architecture)
+- [Technology Stack](#technology-stack)
+- [Project Structure](#project-structure)
+- [Installation and Setup](#installation-and-setup)
+- [Environment Configuration](#environment-configuration)
+- [Running the Application](#running-the-application)
+- [Core Workflows](#core-workflows)
+- [API Endpoints](#api-endpoints)
+- [Evaluation and Observability](#evaluation-and-observability)
+- [Security](#security)
+- [Performance Optimization](#performance-optimization)
+- [Troubleshooting](#troubleshooting)
+- [Future Improvements](#future-improvements)
+- [Author](#author)
 
 ## Overview
 
-**Agentic Adaptive RAG** is an end-to-end Retrieval-Augmented Generation system designed around an agentic workflow rather than a fixed retrieval pipeline.
+Traditional language models can generate fluent answers but may lack access to private documents, current project-specific knowledge, or the visual information contained in uploaded images.
 
-Instead of always performing vector search, the system evaluates the user's question and dynamically determines the appropriate path:
+This project addresses these challenges by integrating retrieval, language-model generation, agentic processing, and image understanding in one application.
 
-- Retrieve information from uploaded documents
-- Fall back to web search when local knowledge is insufficient
-- Generate an answer from trusted context
-- Evaluate whether retrieved documents are relevant
-- Check whether the generated answer is grounded
-- Verify whether the answer actually addresses the question
-- Retry generation when quality gates fail
-- Record evaluation and observability information for each run
-- Apply security controls against prompt injection and sensitive information leakage
-- Support human approval before web search when required.
+The application includes a document-based RAG pipeline, a graph-based workflow for processing and evaluating responses, a multimodal image-question-answering feature, and supporting components for security, testing, evaluation, and observability.
 
-The project includes a **FastAPI backend**, **Next.js frontend**, **LangGraph agent workflow**, vector-based retrieval, LLM-based grading, security controls, evaluation tracking, observability, and Docker deployment.
-
+The goal is to provide a flexible foundation for building AI assistants that can work with both textual knowledge and visual inputs.
 
 ## Key Features
 
-### Agentic Adaptive Retrieval
+### 1. Document Ingestion and Knowledge Retrieval
 
-The system does not blindly retrieve documents for every query.
+- Upload and manage documents through backend APIs.
+- Process documents into content suitable for retrieval.
+- Retrieve relevant context for user questions.
+- Use retrieved information to support grounded answers.
+- Integrate vector-store components for semantic retrieval.
 
-It dynamically routes requests based on the question:
+### 2. Retrieval-Augmented Generation
 
-```text
-                    User Question
-                         │
-                         ▼
-                  Security Checks
-                         │
-                         ▼
-                   Query Router
-                    /         \
-                   /           \
-                  ▼             ▼
-          Local Knowledge     Web Search
-             Retrieval        (when needed)
-                  │             │
-                  ▼             ▼
-           Retrieval Grader     │
-                  │             │
-          ┌───────┴───────┐     │
-          │               │     │
-       Relevant        Not Relevant
-          │               │     │
-          │               └─────┘
-          │                   │
-          └─────────┬─────────┘
-                    ▼
-                Generation
-                    │
-                    ▼
-          Hallucination Grader
-                    │
-                    ▼
-              Answer Grader
-                    │
-              ┌─────┴─────┐
-              │           │
-             Pass        Fail
-              │           │
-              ▼           ▼
-           Response     Retry
-                         │
-                         └──────► Generation
+- Combine retrieved context with language-model generation.
+- Generate answers using relevant information from the knowledge base.
+- Evaluate retrieved documents and generated responses.
+- Support retrieval, generation, and retry workflows through the graph-based pipeline.
+
+### 3. Agentic Workflow Orchestration
+
+The backend includes a graph-based workflow with specialized nodes and chains for tasks such as:
+
+- Query routing.
+- Document retrieval.
+- Document relevance grading.
+- Answer generation.
+- Hallucination and answer-quality grading.
+- Retry handling.
+- Web-search processing and approval workflows.
+- Response construction and output security.
+
+These components provide a structured approach to coordinating retrieval and generation rather than relying on a single unstructured model call for every operation.
+
+### 4. Multimodal Image Understanding
+
+- Upload images and ask natural-language questions.
+- Identify the main subjects, objects, and important visual details.
+- Interpret readable text, labels, numbers, and symbols.
+- Explain diagrams, screenshots, and relationships between visual elements.
+- Produce contextual answers based on image content.
+- Search for related images when requested.
+
+The image-processing workflow uses a configured Gemini model and supports a concise, moderately detailed answer format.
+
+### 5. Web and Related-Image Search
+
+- Support web-search operations within the graph workflow.
+- Provide approval-related handling for supported search workflows.
+- Search for related images when requested by the user.
+- Use retrieved search results as additional context where applicable.
+
+### 6. Security and Input Validation
+
+The backend includes dedicated security components for:
+
+- Input content checks.
+- Prompt-injection handling.
+- Output security checks.
+- Security configuration.
+- Handling instructions embedded in uploaded image content as untrusted input.
+
+### 7. Evaluation and Observability
+
+- Run benchmark-based evaluations.
+- Store and inspect evaluation results.
+- Generate evaluation reports.
+- Support RAG evaluation workflows.
+- Record application execution metrics and latency.
+- Inspect observability data through the frontend.
+
+### 8. Web Application Interface
+
+The Next.js frontend provides an interface for interacting with the backend and includes pages for the main application, evaluation information, and observability data.
+
+---
+
+## System Architecture
+
+The project is organized into a frontend, backend APIs, retrieval and generation components, graph-based orchestration, image processing, security, and evaluation utilities.
+
+```mermaid
+flowchart TD
+    U[User] --> F[Next.js Frontend]
+    F --> A[FastAPI Backend]
+
+    A --> D[Document Ingestion]
+    D --> R[Retrieval Pipeline]
+    R --> G[Agentic Graph Workflow]
+    G --> L[LLM Generation]
+    G --> Q[Grading and Retry Logic]
+    Q --> G
+    G --> O[Structured Response]
+
+    A --> I[Image Understanding]
+    I --> V[Gemini Vision Model]
+    I --> S[Related Image Search]
+
+    A --> SEC[Security Components]
+    A --> E[Evaluation]
+    A --> OBS[Observability]
+
+    O --> F
+    V --> F
+    S --> F
 ```
 
+The diagram represents the main architectural components. The exact execution path depends on the endpoint and the workflow being used.
 
-## Architecture
+## Technology Stack
 
-```text
-┌──────────────────────────────────────────────────────────────┐
-│                         Next.js UI                           │
-│                                                              │
-│  Chat • Document Upload • Evaluation • Observability         │
-└─────────────────────────────┬────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────┐
-│                       FastAPI Backend                         │
-│                                                              │
-│  API • Uploads • Chat • Evaluation • Observability           │
-└─────────────────────────────┬────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────┐
-│                       Security Layer                          │
-│                                                              │
-│  Prompt Injection • Jailbreak Detection • Secret Redaction  │
-│  Document Injection Detection • Output Protection           │
-└─────────────────────────────┬────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────┐
-│                        LangGraph                              │
-│                                                              │
-│  Router → Retrieve → Grade → Generate → Validate → Retry     │
-│                 │                                            │
-│                 └──────────────► Web Search                   │
-└───────────────┬───────────────────────────────┬──────────────┘
-                │                               │
-                ▼                               ▼
-       Vector Store / RAG                  Web Search
-                │                               │
-                └───────────────┬───────────────┘
-                                ▼
-                           LLM / Groq
-                                │
-                                ▼
-                    Evaluation & Observability
-```
+| Layer | Technologies |
+|---|---|
+| Frontend | Next.js, React, TypeScript |
+| Backend | Python, FastAPI |
+| Language and vision models | Google Gemini |
+| LLM integration | LangChain Google GenAI |
+| Retrieval and RAG | LangChain, semantic retrieval, Chroma-related components |
+| Image and web search | Tavily integration |
+| Workflow orchestration | Graph-based processing components |
+| Evaluation | Python evaluation utilities and RAG evaluation scripts |
+| Configuration | Environment variables and `.env` |
+| Containerization | Docker, Docker Compose |
 
-
-# Core Workflow
-
-## 1. Query Routing
-
-The system first determines whether the question can be answered using the available local knowledge or requires external information.
+## Project Structure
 
 ```text
-Question
-   │
-   ▼
-Router
-   │
-   ├── Local knowledge
-   │
-   └── Web search
-```
-
-This prevents unnecessary web searches when relevant uploaded knowledge is available.
-
-
-## 2. Local Document Retrieval
-
-Users can provide their own documents rather than relying on hardcoded knowledge sources.
-
-Supported document formats include:
-
-- PDF
-- DOCX
-- TXT
-- Markdown
-
-Documents are processed and added to the application's vector-based retrieval layer.
-
-
-## 3. Retrieval Grading
-
-Retrieved documents are evaluated for relevance to the user's question.
-
-```text
-Question + Retrieved Document
-            │
-            ▼
-      Retrieval Grader
-            │
-       ┌────┴────┐
-       ▼         ▼
-     Relevant   Irrelevant
-       │         │
-       ▼         ▼
-   Generation  Web Search
-```
-
-This allows the system to recognize when vector retrieval does not provide useful evidence.
-
-
-## 4. Web Search Fallback
-
-When local retrieval is insufficient, the workflow can route the request to web search.
-
-```text
-Local Knowledge
-      │
-      ├── Sufficient ──► Generate
-      │
-      └── Insufficient
-               │
-               ▼
-          Web Search
-               │
-               ▼
-            Generate
-```
-
-The project also supports human approval around web-search execution.
-
-
-## 5. Hallucination Detection
-
-Generated answers are checked against their available context.
-
-```text
-Generated Answer
-       │
-       ▼
-Hallucination Grader
-       │
-   ┌───┴───┐
-   ▼       ▼
-Grounded  Not Grounded
-   │          │
-   ▼          ▼
- Continue    Retry
-```
-
-This provides a quality-control layer between generation and the final response.
-
-
-## 6. Answer Quality Validation
-
-The system also evaluates whether the generated answer actually addresses the original question.
-
-```text
-Question + Answer
-       │
-       ▼
- Answer Grader
-       │
-   ┌───┴───┐
-   ▼       ▼
-   Yes      No
-   │         │
-   ▼         ▼
-Response    Retry
-```
-
-Generation therefore has multiple quality gates rather than simply returning the first LLM response.
-
-
-# Security
-
-Security is integrated into the application rather than treated as an external concern.
-
-Implemented controls include:
-
-### Prompt Injection Detection
-
-Detects malicious instructions attempting to manipulate the agent.
-
-### System Prompt Extraction Protection
-
-Detects attempts to retrieve hidden system instructions.
-
-### Jailbreak Detection
-
-Identifies common attempts to bypass model or application restrictions.
-
-### Document Injection Detection
-
-Uploaded or retrieved content is treated as untrusted information rather than trusted instructions.
-
-### Untrusted Content Handling
-
-External content is wrapped and handled separately from trusted application instructions.
-
-### Output Protection
-
-The output layer can redact sensitive information such as:
-
-- API keys
-- Groq secrets
-- Environment secrets
-
-### Output Length Protection
-
-Responses are constrained to prevent uncontrolled output.
-
-
-# Evaluation
-
-The project includes automated evaluation components for the RAG and agent workflow.
-
-Evaluation covers:
-
-- Retrieval quality
-- Hallucination/grounding
-- Answer relevance
-- Routing behavior
-- Generation retry behavior
-- Response validation
-- Evaluation tracking
-
-Evaluation results can be persisted for later analysis.
-
-
-# Observability
-
-The application includes an observability layer for tracking agent executions.
-
-Recorded information includes:
-
-- Selected route
-- Number of retrieved documents
-- Grounding results
-- Retry count
-- Latency
-- Source counts
-- Human-in-the-loop usage
-- Evaluation information
-
-This makes it possible to inspect how the agent arrived at a response rather than treating the LLM as a black box.
-
-
-# Human-in-the-Loop
-
-The architecture includes a human approval step for web-search execution.
-
-```text
-Agent decides Web Search
-          │
-          ▼
-     Approval Step
-       /       \
-      /         \
- Approve       Reject
-    │             │
-    ▼             ▼
-Web Search     Rejection
-```
-
-This provides an additional control point before external retrieval is executed.
-
-
-# Technology Stack
-
-## Backend
-
-- Python
-- FastAPI
-- LangGraph
-- LangChain
-- Groq
-- Pydantic
-
-## AI / ML
-
-- Retrieval-Augmented Generation
-- Agentic workflows
-- LLM-based grading
-- Hallucination detection
-- Prompt engineering
-- Embeddings
-- Vector search
-
-## Storage
-
-- Chroma
-- Document storage
-- Evaluation history
-- Observability history
-
-## Frontend
-
-- Next.js
-- React
-- TypeScript
-
-## Deployment
-
-- Docker
-- Docker Compose
-- Uvicorn
-
-## Testing
-
-- Pytest
-
-
-# Project Structure
-
-```text
-Agentic-Adaptive-RAG/
-│
+RAG-with-Image-Understanding/
 ├── backend/
 │   ├── api.py
+│   ├── main.py
 │   ├── config.py
 │   ├── model.py
+│   ├── image_search.py
 │   ├── ingestion.py
 │   ├── retrieval.py
 │   ├── response.py
 │   ├── sources.py
 │   ├── evaluation.py
 │   ├── observability.py
-│   ├── main.py
-│   │
 │   ├── graph/
-│   │   ├── graph.py
-│   │   ├── state.py
-│   │   ├── consts.py
-│   │   ├── context.py
-│   │   │
 │   │   ├── chains/
-│   │   │   ├── answer_grader.py
-│   │   │   ├── generation.py
-│   │   │   ├── hallucination_grader.py
-│   │   │   ├── retrieval_grader.py
-│   │   │   └── router.py
-│   │   │
-│   │   └── nodes/
-│   │       ├── build_response.py
-│   │       ├── generate.py
-│   │       ├── grade_documents.py
-│   │       ├── increment_retry.py
-│   │       ├── retrieve.py
-│   │       ├── web_search.py
-│   │       ├── web_search_approval.py
-│   │       └── web_search_rejected.py
-│   │
-│   └── security/
-│       ├── content_guard.py
-│       ├── output_guard.py
-│       ├── prompt_guard.py
-│       ├── security_config.py
-│       └── tests/
-│
-├── evaluation/
-│   ├── benchmarks/
-│   ├── results/
-│   └── ragas/
-│
+│   │   ├── nodes/
+│   │   ├── graph.py
+│   │   ├── context.py
+│   │   ├── consts.py
+│   │   └── state.py
+│   ├── security/
+│   │   ├── content_guard.py
+│   │   ├── output_guard.py
+│   │   ├── prompt_guard.py
+│   │   └── security_config.py
+│   ├── documents/
+│   └── evaluation/
 ├── frontend/
-│   ├── app/
-│   ├── components/
+│   ├── src/
+│   │   └── app/
+│   │       ├── page.tsx
+│   │       ├── evaluation/
+│   │       └── observability/
 │   ├── public/
-│   ├── Dockerfile
-│   └── next.config.ts
-│
-├── data/
-├── uploads/
-│
-├── .chroma/
+│   ├── package.json
+│   └── README.md
+├── .env.example
+├── .gitignore
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
-├── .env.example
-├── .gitignore
 └── README.md
 ```
 
+## Installation and Setup
 
-# Installation
+### Prerequisites
 
-## Prerequisites
+Install the following tools:
 
-Make sure you have:
+- Python compatible with the project's dependencies.
+- Node.js and npm.
+- Git.
+- A Google AI API key for the configured Gemini model.
+- A Tavily API key if you use features that require Tavily search.
 
-- Python 3.11+
-- Node.js 20+
-- Docker Desktop
-- Git
-- A Groq API key
+### 1. Clone the repository
 
-
-# Environment Variables
-
-Create a `.env` file in the project root.
-
-Example:
-
-```env
-GROQ_API_KEY=your_groq_api_key
-
-MAX_UPLOAD_SIZE_MB=10
-
-FRONTEND_URL=http://localhost:3000
+```bash
+git clone https://github.com/Ruthvik2910/RAG-with-Image-Understanding.git
+cd RAG-with-Image-Understanding
 ```
 
-Use `.env.example` as the template for the complete configuration.
+### 2. Set up the Python environment
 
-**Never commit your real API key to Git.**
+From the project root, create a virtual environment:
 
-
-# Running Locally
-
-## 1. Clone the repository
-
-```powershell
-git clone <your-repository-url>
-cd Agentic-Adaptive-RAG
-```
-
-## 2. Create a virtual environment
-
-```powershell
+```bash
 python -m venv .venv
 ```
 
-Activate it:
+Activate it on Windows PowerShell:
 
 ```powershell
-.venv\Scripts\Activate
+.\.venv\Scripts\Activate.ps1
 ```
 
-## 3. Install dependencies
+Install the backend dependencies:
 
-```powershell
-pip install -r requirements.txt
+```bash
+python -m pip install -r requirements.txt
 ```
 
-## 4. Configure environment variables
+If PowerShell blocks environment activation, use an appropriate execution-policy setting for the current terminal or invoke the virtual environment's Python executable directly.
 
-Create `.env` and add your API configuration.
+### 3. Configure environment variables
 
-## 5. Start the backend
+Create a local `.env` file using `.env.example` as your reference. For example:
 
-```powershell
-uvicorn backend.api:api --reload
+```dotenv
+GOOGLE_API_KEY=your_google_api_key
+VISION_MODEL=gemini-3.5-flash-lite
 ```
 
-Backend:
+Add the other variables required by the application and its optional integrations. Use placeholder values in `.env.example` and real credentials only in your local `.env`.
 
-```text
-http://localhost:8000
+Do not commit `.env` or expose API keys in source code.
+
+### 4. Start the backend
+
+From the project root, with the virtual environment activated:
+
+```bash
+python -m uvicorn backend.api:app --reload
 ```
 
-Swagger documentation:
+The backend should be available at:
 
-```text
-http://localhost:8000/docs
-```
+- **API:** `http://127.0.0.1:8000`
+- **Interactive API documentation:** `http://127.0.0.1:8000/docs`
 
-Health check:
+Keep the backend terminal running.
 
-```text
-http://localhost:8000/health
-```
+### 5. Start the frontend
 
-## 6. Start the frontend
+Open a second terminal:
 
-Open another terminal:
-
-```powershell
+```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-Frontend:
+Open the application:
 
-```text
-http://localhost:3000
-```
+**http://localhost:3000**
 
+Keep both the frontend and backend processes running while using the application.
 
-# Running with Docker
+## Core Workflows
 
-Docker Compose is provided for running the complete application.
+### Document Question Answering
 
-Make sure **Docker Desktop is running** before executing the commands below.
+1. A user submits a question or uploads a supported document.
+2. The backend processes the request.
+3. The retrieval pipeline finds relevant knowledge when required.
+4. The graph workflow routes the request through the appropriate processing steps.
+5. The generation component produces an answer using the available context.
+6. Grading, retry, security, and response-building components participate according to the workflow.
+7. The frontend displays the result.
 
-From the project root:
+### Image Question Answering
 
-```powershell
-docker compose build
-```
+1. A user uploads an image and asks a question.
+2. The image endpoint passes the image and question to the configured Gemini model.
+3. The model interprets the visual content and generates a contextual answer.
+4. The backend returns the answer and associated response metadata.
+5. If related images are requested, the application can run additional image analysis and search operations.
 
-Start the application:
+The ordinary image-question path has been optimized to avoid an unnecessary separate image-analysis call. Additional analysis is performed when required for related-image search.
 
-```powershell
-docker compose up
-```
+### Evaluation and Monitoring
 
-Or run in detached mode:
+1. Run the relevant evaluation script.
+2. Inspect the resulting evaluation artifacts.
+3. Use the evaluation and observability endpoints or frontend pages to examine available results.
+4. Compare results and latency after making changes to the retrieval, generation, or image-processing pipeline.
 
-```powershell
-docker compose up -d
-```
+## API Endpoints
 
-The services are exposed at:
+The backend includes routes for chat, image question answering, document management, evaluation, observability, and workflow operations.
 
-```text
-Frontend:
-http://localhost:3000
+Important endpoints include:
 
-Backend:
-http://localhost:8000
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/` | Root endpoint |
+| GET | `/health` | Health check |
+| GET | `/documents` | List available documents |
+| POST | `/upload` | Upload documents |
+| DELETE | `/documents/{document_id}` | Delete a document |
+| POST | `/chat` | Submit a chat question |
+| POST | `/chat/image` | Ask a question about an image |
+| POST | `/chat/approval` | Handle approval-related workflow |
+| GET | `/evaluation` | Retrieve evaluation information |
+| DELETE | `/evaluation` | Clear evaluation data |
+| GET | `/observability` | Retrieve observability information |
+| DELETE | `/observability` | Clear observability data |
 
-API documentation:
-http://localhost:8000/docs
-```
+Additional routes and request requirements may be present in the current implementation. The running API documentation at `http://127.0.0.1:8000/docs` is the authoritative reference for available operations and request schemas.
 
-Check container status:
+## Evaluation and Observability
 
-```powershell
-docker compose ps
-```
+The repository contains scripts and components for assessing application behavior and inspecting performance.
 
-View logs:
+Relevant files include:
 
-```powershell
-docker compose logs -f
-```
+- `backend/evaluation.py`
+- `backend/evaluation/run_benchmark.py`
+- `backend/evaluation/run_ragas.py`
+- `backend/evaluation/generate_report.py`
+- `backend/observability.py`
 
-Stop the application:
+These components support evaluation workflows, benchmark execution, report generation, and application monitoring.
 
-```powershell
-docker compose down
-```
+Run an evaluation script from the project root using the active Python environment. Check the script's arguments and configuration before executing it, as different evaluation tasks may require separate dependencies, datasets, credentials, or model access.
 
+## Performance Optimization
 
-# API
+The image-question-answering workflow has been optimized through:
 
-The FastAPI backend exposes endpoints for:
+- Using a Flash-Lite Gemini model for image requests.
+- Removing an unnecessary second model call for ordinary image questions.
+- Simplifying the image-answering prompt while preserving useful detail.
+- Using a moderately detailed response format.
+- Measuring model request duration with latency logs.
 
-- Health checks
-- Document upload
-- Document management
-- Chat/query execution
-- Evaluation
-- Observability
+During local testing, image-model request time was reduced from several minutes to a few seconds. The measured time varied with the model and prompt; actual latency depends on service availability, network conditions, image complexity, and answer length.
 
-Interactive API documentation is available through:
+Performance should be evaluated across the complete application, not just the image endpoint. Retrieval, document processing, graph execution, external search, and frontend communication can contribute additional latency.
 
-```text
-http://localhost:8000/docs
-```
+## Security and Configuration
 
+- Keep real credentials in `.env`.
+- Keep `.env` excluded through `.gitignore`.
+- Use `.env.example` to document required variables without publishing secrets.
+- Treat user uploads and embedded image instructions as untrusted input.
+- Avoid committing sensitive documents or private evaluation data.
+- Review API exposure and environment configuration before deploying publicly.
 
-# Testing
+## Docker and Deployment
 
-The project includes automated tests covering the core agent, evaluation, response, and security components.
+The repository includes:
 
-Run the complete test suite:
+- `Dockerfile`
+- `docker-compose.yml`
+- `frontend/Dockerfile`
 
-```powershell
-python -m pytest -v
-```
+These files provide containerization support. Before deploying, review the Docker configuration, required environment variables, service networking, persistent storage requirements, and production server settings.
 
-Current verification:
+Local development instructions above are the recommended starting point for verifying that the application works before deployment.
 
-```text
-33 passed
-```
+## Troubleshooting
 
-The test suite covers:
+### Backend fails to start
 
-```text
-✓ Retrieval grading
-✓ Hallucination grading
-✓ Answer grading
-✓ Query routing
-✓ Local RAG path
-✓ Web-search fallback
-✓ Generation retries
-✓ Quality gates
-✓ Evaluation tracking
-✓ Response validation
-✓ Prompt injection protection
-✓ System prompt extraction protection
-✓ Jailbreak detection
-✓ Document injection detection
-✓ Untrusted content handling
-✓ Secret redaction
-✓ Output protection
-```
-
-
-# Example Workflow
-
-### Step 1 — Upload a document
-
-Upload a supported document through the application.
-
-```text
-PDF / DOCX / TXT / MD
-          │
-          ▼
-      Ingestion
-          │
-          ▼
-      Chunking
-          │
-          ▼
-   Vector Storage
-```
-
-### Step 2 — Ask a question
-
-```text
-"What are the main conclusions of this document?"
-```
-
-### Step 3 — Agent processes the question
-
-```text
-Question
-   ↓
-Security Check
-   ↓
-Route
-   ↓
-Retrieve
-   ↓
-Grade Documents
-   ↓
-Generate
-   ↓
-Check Grounding
-   ↓
-Check Answer Quality
-   ↓
-Final Response
-```
-
-### Step 4 — Inspect execution
-
-Use the observability interface to inspect the execution path and evaluation information.
-
-
-# Why This Project Is Agentic
-
-A conventional RAG pipeline might look like:
-
-```text
-Question
-   ↓
-Vector Search
-   ↓
-LLM
-   ↓
-Answer
-```
-
-This project introduces decision-making and feedback loops:
-
-```text
-                         ┌───────────────┐
-                         │    Router     │
-                         └───────┬───────┘
-                                 │
-                   ┌─────────────┴─────────────┐
-                   ▼                           ▼
-             Local Retrieval              Web Search
-                   │
-                   ▼
-           Retrieval Grader
-                   │
-            ┌──────┴──────┐
-            ▼             ▼
-         Relevant      Not Relevant
-            │             │
-            └──────┬──────┘
-                   ▼
-               Generation
-                   │
-                   ▼
-          Hallucination Check
-                   │
-                   ▼
-             Answer Check
-                   │
-            ┌──────┴──────┐
-            ▼             ▼
-          Accept         Retry
-                            │
-                            └──────► Generation
-```
-
-The system therefore combines:
-
-- Routing
-- Tool selection
-- Retrieval
-- Evaluation
-- Feedback
-- Retry
-- Human approval
-
-within a stateful LangGraph workflow.
-
-
-# Engineering Highlights
-
-### Adaptive Retrieval
-
-Rather than assuming vector search is always sufficient, the system evaluates retrieval quality and can transition to external search.
-
-### Self-Evaluation
-
-The system evaluates both retrieved evidence and generated responses.
-
-### Quality-Controlled Generation
-
-Generation is not automatically accepted. Hallucination and answer-quality checks determine whether the response should be returned or regenerated.
-
-### Security-Aware RAG
-
-Documents and external content are treated as potentially untrusted input, with dedicated controls for prompt injection and output leakage.
-
-### Observability
-
-Agent execution information is recorded so the behavior of the system can be analyzed.
-
-### Containerized Deployment
-
-Both frontend and backend are containerized and orchestrated using Docker Compose.
-
-
-# Testing Philosophy
-
-The project tests the behavior of individual components as well as the agent workflow.
-
-The goal is not simply to verify that functions execute successfully, but to validate important agent behaviors:
-
-```text
-Routing
-Retrieval
-Fallback
-Generation
-Validation
-Retry
-Security
-Evaluation
-```
-
-
-# Future Improvements
-
-The current implementation focuses on the core Agentic RAG architecture.
-
-Potential future production improvements include:
-
-- Authentication and authorization
-- API rate limiting
-- Advanced document malware scanning
-- More comprehensive file-type validation
-- ZIP/archive resource limits
-- Dependency vulnerability scanning
-- Container image scanning
-- Distributed observability
-- Production vector database
-- Background document processing
-- Streaming responses
-- Advanced RAG evaluation dashboards
-- Persistent conversation memory
-- Multi-user support
-- Cloud deployment
-
-These are intentionally treated as future production-hardening improvements rather than prerequisites for the current system.
-
-
-# Project Status
-
-| Component | Status |
-|---|---|
-| Agentic workflow | ✅ |
-| LangGraph orchestration | ✅ |
-| Adaptive routing | ✅ |
-| Vector retrieval | ✅ |
-| Web-search fallback | ✅ |
-| Retrieval grading | ✅ |
-| Hallucination grading | ✅ |
-| Answer grading | ✅ |
-| Generation retry | ✅ |
-| Human-in-the-loop | ✅ |
-| Security layer | ✅ |
-| Evaluation | ✅ |
-| Observability | ✅ |
-| FastAPI backend | ✅ |
-| Next.js frontend | ✅ |
-| Docker backend | ✅ |
-| Docker frontend | ✅ |
-| Automated tests | ✅ 33 passed |
-
-
-Machine Learning Engineer | Generative AI | Agentic AI | LLM Systems
-
-```text
-Python • LangGraph • LangChain • RAG • LLMs
-FastAPI • Docker • Vector Search • Generative AI
-```
-
-## Image Question Answering
-
-The application supports image-grounded questions. A user can upload an image and either ask a specific question or submit the image without a question. The vision model analyzes the actual image, extracts readable text/OCR as supporting evidence, and generates the answer from the image itself. Related-image search is optional enrichment and is only triggered when the user explicitly asks to find/search/show related or similar images.
-
-Required environment variables:
-- `GOOGLE_API_KEY`
-- `VISION_MODEL` (default: `gemini-2.5-flash`)
-- `TAVILY_API_KEY` is only needed for optional related-image search.
+- Activate the intended Python environment.
+- Install dependencies from `requirements.txt`.
+- Check for missing environment variables and import errors.
+- Review the terminal output for the actual failure.
+
+### Frontend fails to start
+
+- Verify Node.js and npm are accessible.
+- Run `npm install` in the `frontend` directory.
+- Check for dependency, configuration, or compilation errors.
+
+### Gemini requests fail
+
+- Confirm that the API key is valid and loaded.
+- Verify that the configured model is available to your API project.
+- Review the backend logs for errors such as `503 UNAVAILABLE` and `504 Deadline Exceeded`.
+- Distinguish service-capacity errors from application-code errors.
+
+### RAG answers are inaccurate
+
+- Check whether relevant documents were ingested.
+- Verify that retrieval returns appropriate context.
+- Inspect retrieval grading and generation behavior.
+- Use the evaluation scripts to compare changes.
+
+### Responses are slow
+
+- Measure the latency of individual stages where possible.
+- Compare retrieval, generation, image analysis, and external search separately.
+- Test with repeatable inputs and avoid judging performance from a single request.
+
+## Future Improvements
+
+Potential areas for further development include:
+
+- More comprehensive retrieval and answer-quality evaluation.
+- Improved OCR accuracy for small or low-resolution text.
+- More efficient document ingestion and retrieval.
+- Better latency monitoring across the entire workflow.
+- Expanded automated tests for text, document, and image queries.
+- Improved deployment automation and production observability.
+- Additional user-facing controls for sources, confidence, and response detail.
+
+## Author
+
+**Ruthvik Reddy**
+
+GitHub: [@Ruthvik2910](https://github.com/Ruthvik2910)
+
+## License
+
+No license has been specified. Add a license file if you intend to define permissions for reuse, modification, and distribution.
+
+---
+
+If you find the project useful, consider starring the repository.
+
+**Repository:** [RAG-with-Image-Understanding](https://github.com/Ruthvik2910/RAG-with-Image-Understanding)
