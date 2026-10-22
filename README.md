@@ -441,17 +441,7 @@ Potential areas for further development include:
 - Improved deployment automation and production observability.
 - Additional user-facing controls for sources, confidence, and response detail.
 
-## Author
 
-**Ruthvik Reddy**
-
-GitHub: [@Ruthvik2910](https://github.com/Ruthvik2910)
-
-## License
-
-No license has been specified. Add a license file if you intend to define permissions for reuse, modification, and distribution.
-
----
 
 If you find the project useful, consider starring the repository.
 
