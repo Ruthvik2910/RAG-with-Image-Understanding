@@ -1,4 +1,4 @@
-# RAG with Image Understanding
+# Retrieval-Augmented Generation(RAG) with Image Understanding
 
 An AI-powered application that combines **Retrieval-Augmented Generation (RAG), agentic workflows, document intelligence, and multimodal image understanding** in a unified web application.
 
