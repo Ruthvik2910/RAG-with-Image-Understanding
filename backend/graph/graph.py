@@ -90,11 +90,15 @@ def route_question(
     print("---ROUTE QUESTION---")
 
     question = state["question"]
-
+    candidate_documents = state.get("candidate_documents", [])
     context = state.get(
         "router_context",
         "",
     )
+
+    if candidate_documents and not context.strip():
+        print("---ROUTER FALLBACK: LOCAL EVIDENCE EXISTS, PREFER LOCAL RAG---")
+        return "retrieve"
 
     route = question_router.invoke(
         {

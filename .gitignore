@@ -14,8 +14,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -293,7 +293,7 @@ api_keys.txt
 tokens.json
 
 # Docker
-.dockerignore
+
 docker-compose.override.yml
 data/documents/chroma.txt
 data/documents/test.txt
@@ -310,3 +310,35 @@ evaluation/ragas_results.json
 evaluation/final_report.json
 observability_history.jsonl
 uploads/
+# Scoped document database, originals, credentials, and sessions
+data/
+.env
+
+
+
+# Frontend dependencies and builds
+node_modules/
+.next/
+*.tsbuildinfo
+
+# Environment files; keep the safe example
+.env.*
+!.env.example
+
+# Additional secrets and credentials
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account.json
+secrets.json
+secrets.yaml
+secrets.yml
+api_keys.txt
+tokens.json
+
+# Environment files
+.env
+.env.*
+!.env.example

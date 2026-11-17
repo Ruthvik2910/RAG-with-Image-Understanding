@@ -34,6 +34,8 @@ COPY --from=builder --chown=node:node /app/public ./public
 
 USER node
 
-EXPOSE 10000
+ENV PORT=3000
+
+EXPOSE 3000
 
 CMD ["sh", "-c", "node server.js"]

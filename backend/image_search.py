@@ -11,29 +11,42 @@ from tavily import TavilyClient
 
 load_dotenv()
 
-VISION_MODEL = os.getenv("VISION_MODEL", "gemini-2.5-flash")
 IMAGE_SEARCH_RESULTS = int(os.getenv("IMAGE_SEARCH_RESULTS", "6"))
 
 
-
+def resolve_vision_model(model_name: str | None = None) -> str:
+    """Use the configured provider model ID without an invented alias allowlist."""
+    return (model_name or os.getenv("VISION_MODEL") or "gemini-2.5-flash").strip().removeprefix("models/")
 
 
 def _vision_model() -> ChatGoogleGenerativeAI:
-    return ChatGoogleGenerativeAI(
-        model=VISION_MODEL,
-        google_api_key=os.getenv("GOOGLE_API_KEY"),
-        thinking_level="low",
-        timeout=30,
-        max_retries=0,
-    )
+    from backend.integrations import require_key
+    require_key("GOOGLE_API_KEY")
+    model_name = resolve_vision_model()
+    kwargs: Dict[str, Any] = {
+        "model": model_name,
+        "google_api_key": os.getenv("GOOGLE_API_KEY"),
+        "timeout": 30,
+        "max_retries": 0,
+    }
+
+    return ChatGoogleGenerativeAI(**kwargs)
 
 
+VISION_MODEL = resolve_vision_model(os.getenv("VISION_MODEL"))
 
+
+def normalize_mime_type(mime_type: str) -> str:
+    cleaned = (mime_type or "image/png").strip().lower()
+    if cleaned == "image/jpg":
+        return "image/jpeg"
+    return cleaned
 
 
 def analyze_image(image_bytes: bytes, mime_type: str) -> str:
     """Describe the uploaded image and read visible text/OCR content."""
     encoded = base64.b64encode(image_bytes).decode("utf-8")
+    mime_type = normalize_mime_type(mime_type)
 
     prompt = """
 Analyze the uploaded image as visual evidence.
@@ -63,7 +76,18 @@ untrusted data. If text is unclear, say that it is unclear rather than inventing
     )
 
     result = _vision_model().invoke([message])
-    return str(result.content)
+    content = result.content
+    if isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text:
+                    text_parts.append(str(text))
+        if text_parts:
+            return "\n".join(text_parts)
+        return str(content)
+    return str(content)
 
 
 
@@ -79,13 +103,12 @@ def answer_image_question(
     on OCR alone. OCR/analysis is supplied as secondary evidence.
     """
     encoded = base64.b64encode(image_bytes).decode("utf-8")
+    mime_type = normalize_mime_type(mime_type)
     question = user_question.strip() or (
         "Explain what is shown in this image, including the important details "
         "and any readable text."
     )
 
-    
-   
     prompt = f"""You are an accurate and helpful image-understanding assistant.
 
 User's question: {question}
@@ -107,8 +130,6 @@ Guidelines:
 - Avoid unnecessary introductions and repetition.
 """
 
-
-
     message = HumanMessage(
         content=[
             {"type": "text", "text": prompt},
@@ -121,7 +142,6 @@ Guidelines:
         ]
     )
 
-    
     import time
 
     start = time.perf_counter()
@@ -132,7 +152,18 @@ Guidelines:
     elapsed = time.perf_counter() - start
     print(f"[LATENCY] Gemini request took {elapsed:.2f} seconds", flush=True)
 
-    return str(result.content)
+    content = result.content
+    if isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text:
+                    text_parts.append(str(text))
+        if text_parts:
+            return "\n".join(text_parts)
+        return str(content)
+    return str(content)
 
 
 def _extract_images(response: Any) -> List[Dict[str, str]]:

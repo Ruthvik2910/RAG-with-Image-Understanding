@@ -1,5 +1,8 @@
 "use client";
 
+import { apiFetch } from "@/lib/api";
+import ResponseMarkdown from "@/components/ResponseMarkdown";
+
 import {
   ChangeEvent,
   FormEvent,
@@ -15,6 +18,8 @@ type DocumentItem = {
   file_type?: string;
   source?: string;
   chunk_count?: number;
+  size_bytes?: number;
+  status?: string;
 };
 
 type Source = {
@@ -44,6 +49,7 @@ type ChatResponse = {
   security_reason?: string;
   security_redactions?: number;
   web_search?: boolean;
+  full_document?: { document_id: string; file_name: string; part: number; total_parts: number; next_part: number | null; text: string; line_start: number; line_end: number };
   related_images?: { url: string; title?: string; source?: string }[];
   image_analysis?: string;
   image_search_query?: string;
@@ -56,6 +62,7 @@ const API_URL =
 
 export default function Home() {
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
+  const [legacyKey, setLegacyKey] = useState("");
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [selectedImage, setSelectedImage] = useState<File | null>(null);
   const [question, setQuestion] = useState("");
@@ -64,6 +71,7 @@ export default function Home() {
 
   const [loadingDocuments, setLoadingDocuments] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadConfig, setUploadConfig] = useState<{ upload_limits: Record<string, { max_bytes: number; max_mb: number }>; max_files: number; image_max_bytes: number; legacy_import_available?: boolean } | null>(null);
   const [asking, setAsking] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
@@ -78,15 +86,18 @@ export default function Home() {
   const imageInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    loadDocuments();
+    apiFetch(`${API_URL}/config`).then(async (res) => {
+      if (!res.ok) throw new Error("Unable to load upload limits.");
+      setUploadConfig(await res.json());
+      await loadDocuments();
+    }).catch((err) => setError(err instanceof Error ? err.message : "Unable to connect to backend."));
   }, []);
 
   async function loadDocuments() {
     try {
       setLoadingDocuments(true);
-      setError("");
 
-      const res = await fetch(`${API_URL}/documents`, {
+      const res = await apiFetch(`${API_URL}/documents`, {
         method: "GET",
         cache: "no-store",
       });
@@ -116,6 +127,18 @@ export default function Home() {
       return;
     }
 
+    if (!uploadConfig) { setError("Upload limits are loading. Try again shortly."); return; }
+    if (files.length > uploadConfig.max_files) { setError(`Select at most ${uploadConfig.max_files} files.`); return; }
+    for (const file of files) {
+      const ext = "." + file.name.split(".").pop()?.toLowerCase();
+      const limit = uploadConfig.upload_limits[ext];
+      if (!limit) { setError(`Unsupported file: ${file.name}`); return; }
+      if (!file.size) { setError(`${file.name} is empty.`); return; }
+      if (file.size > limit.max_bytes) {
+        setError(`File upload failed. The maximum allowed ${ext.slice(1).toUpperCase()} size is ${limit.max_mb} MB. Your uploaded file is ${(file.size / 1048576).toFixed(2)} MB. Please upload a smaller file.`);
+        return;
+      }
+    }
     setSelectedFiles(files);
     setError("");
     setSuccess("");
@@ -158,7 +181,7 @@ export default function Home() {
        * The browser automatically creates:
        * multipart/form-data; boundary=...
        */
-      const res = await fetch(`${API_URL}/upload`, {
+      const res = await apiFetch(`${API_URL}/upload`, {
         method: "POST",
         body: formData,
       });
@@ -180,6 +203,9 @@ export default function Home() {
           } uploaded successfully.`
       );
 
+      if (Array.isArray(data.rejected) && data.rejected.length) {
+        setError(data.rejected.map((item: { file_name: string; reason: string }) => `${item.file_name}: ${item.reason}`).join("\n"));
+      }
       // Clear the file picker after successful upload.
       clearFileSelection();
 
@@ -189,6 +215,7 @@ export default function Home() {
         err instanceof Error ? err.message : "Unable to upload documents."
       );
     } finally {
+      await loadDocuments();
       setUploading(false);
     }
   }
@@ -199,7 +226,7 @@ export default function Home() {
       setError("");
       setSuccess("");
 
-      const res = await fetch(`${API_URL}/documents/${documentId}`, {
+      const res = await apiFetch(`${API_URL}/documents/${documentId}`, {
         method: "DELETE",
       });
 
@@ -224,6 +251,10 @@ export default function Home() {
   function handleImageChange(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0] || null;
     if (!file) return;
+    if (!uploadConfig) { setError("Upload limits are loading."); return; }
+    if (!file.size || file.size > uploadConfig.image_max_bytes) {
+      setError(`Image must be non-empty and at most ${uploadConfig.image_max_bytes / 1048576} MB.`); return;
+    }
     if (!file.type.startsWith("image/")) {
       setError("Please select an image file.");
       return;
@@ -267,12 +298,12 @@ export default function Home() {
         const formData = new FormData();
         formData.append("question", effectiveQuestion);
         formData.append("image", selectedImage);
-        res = await fetch(`${API_URL}/chat/image`, {
+        res = await apiFetch(`${API_URL}/chat/image`, {
           method: "POST",
           body: formData,
         });
       } else {
-        res = await fetch(`${API_URL}/chat`, {
+        res = await apiFetch(`${API_URL}/chat`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -305,16 +336,7 @@ export default function Home() {
        * Human-in-the-loop:
        * The backend can request approval before web search.
        */
-      const hitlStatus =
-        typeof data.hitl_status === "string"
-          ? data.hitl_status.toLowerCase()
-          : "";
-
-      if (
-        hitlStatus === "pending" ||
-        hitlStatus === "awaiting_approval" ||
-        hitlStatus === "approval_required"
-      ) {
+      if (data.status === "approval_required" && typeof data.thread_id === "string") {
         setPendingApproval(true);
         setApprovalReason(
           typeof data.hitl_reason === "string"
@@ -342,7 +364,7 @@ export default function Home() {
       setError("");
       setSuccess("");
 
-      const res = await fetch(`${API_URL}/chat/approval`, {
+      const res = await apiFetch(`${API_URL}/chat/approval`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -379,6 +401,43 @@ export default function Home() {
     } finally {
       setAsking(false);
     }
+  }
+
+  async function loadNextPart() {
+    const full = response?.full_document;
+    if (!full?.next_part) return;
+    try {
+      setAsking(true); setError("");
+      const res = await apiFetch(`${API_URL}/documents/${full.document_id}/text?part=${full.next_part}`);
+      const part = await res.json();
+      if (!res.ok) throw new Error(part.detail || "Could not load the next part.");
+      setResponse((current) => ({ ...current, full_document: part,
+        answer: `${part.file_name} — part ${part.part}/${part.total_parts}, lines ${part.line_start}–${part.line_end}\n\n${part.text}`,
+        generation: part.text }));
+    } catch (err) { setError(err instanceof Error ? err.message : "Could not load the next part."); }
+    finally { setAsking(false); }
+  }
+
+  async function importLegacy() {
+    try {
+      setUploading(true); setError("");
+      const res = await apiFetch(`${API_URL}/documents/import-legacy`, { method: "POST", headers: { "X-Legacy-Import-Key": legacyKey } });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Recovery failed.");
+      setSuccess(data.message); setLegacyKey(""); await loadDocuments();
+    } catch (err) { setError(err instanceof Error ? err.message : "Recovery failed."); }
+    finally { setUploading(false); }
+  }
+
+  async function retryIndex(documentId: string) {
+    try {
+      setError(""); setUploading(true);
+      const res = await apiFetch(`${API_URL}/documents/${documentId}/index`, { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Indexing failed.");
+      setSuccess("Document indexed successfully."); await loadDocuments();
+    } catch (err) { setError(err instanceof Error ? err.message : "Indexing failed."); }
+    finally { setUploading(false); }
   }
 
   function handleQuestionKeyDown(
@@ -478,15 +537,25 @@ export default function Home() {
                 ref={fileInputRef}
                 type="file"
                 multiple
-                accept=".pdf,.docx,.txt,.md"
+                accept={uploadConfig ? Object.keys(uploadConfig.upload_limits).join(",") : ".pdf,.docx,.txt,.md"}
+                disabled={!uploadConfig || uploading}
                 onChange={handleFileChange}
                 className="block w-full cursor-pointer rounded-xl border border-slate-700 bg-slate-950 p-2 text-xs text-slate-400 file:mr-3 file:rounded-lg file:border-0 file:bg-slate-800 file:px-3 file:py-2 file:text-xs file:font-medium file:text-slate-200 hover:file:bg-slate-700"
               />
 
               <p className="mt-2 text-[11px] leading-4 text-slate-500">
-                Supported: PDF, DOCX, TXT, Markdown
+                {uploadConfig
+                  ? Object.entries(uploadConfig.upload_limits).map(([ext, limit]) => `${ext.slice(1).toUpperCase()}: ${limit.max_mb} MB`).join(" · ") + ` · Up to ${uploadConfig.max_files} files`
+                  : "Loading upload limits…"}
               </p>
 
+              {uploadConfig?.legacy_import_available && (
+                <div className="mt-4 space-y-2 border-t border-slate-800 pt-3">
+                  <p className="text-xs text-slate-400">Recover existing knowledge-base metadata. Original files must be reuploaded for exact text.</p>
+                  <input type="password" value={legacyKey} onChange={(event) => setLegacyKey(event.target.value)} placeholder="Administrator import key" aria-label="Administrator import key" className="w-full rounded-lg border border-slate-700 bg-slate-950 p-2 text-xs" />
+                  <button type="button" disabled={!legacyKey || uploading} onClick={() => importLegacy()} className="text-xs text-amber-300 disabled:opacity-50">Recover existing documents</button>
+                </div>
+              )}
               {selectedFiles.length > 0 && (
                 <div className="mt-4 space-y-2">
                   {selectedFiles.map((file, index) => (
@@ -570,6 +639,10 @@ export default function Home() {
                           >
                             {document.file_name}
                           </p>
+                          <p className="text-[10px] text-slate-500">{document.size_bytes !== undefined ? `${(document.size_bytes / 1024).toFixed(1)} KB · ${document.status}` : ""}</p>
+                          {(document.status === "extracted" || document.status === "legacy_partial") && (
+                            <button type="button" disabled={uploading} onClick={() => retryIndex(document.document_id)} className="mt-2 text-xs text-amber-300 disabled:opacity-50">Retry indexing</button>
+                          )}
 
                           <p className="mt-1 text-[10px] uppercase text-slate-500">
                             {document.file_type ||
@@ -726,7 +799,7 @@ export default function Home() {
 
                   <button
                     type="submit"
-                    disabled={asking || !question.trim()}
+                    disabled={asking || (!question.trim() && !selectedImage)}
                     className="rounded-xl bg-white px-5 py-2.5 text-sm font-medium text-black transition hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-40"
                   >
                     {asking ? "Thinking..." : "Ask Agent"}
@@ -805,9 +878,18 @@ export default function Home() {
                     )}
                   </div>
 
-                  <div className="whitespace-pre-wrap text-sm leading-7 text-slate-300">
-                    {getAnswer()}
-                  </div>
+                  {response.route === "full" ? (
+                    <div className="whitespace-pre-wrap break-words font-mono text-sm leading-7 text-slate-300">
+                      {getAnswer()}
+                    </div>
+                  ) : (
+                    <ResponseMarkdown>{getAnswer()}</ResponseMarkdown>
+                  )}
+                  {response.full_document?.next_part && (
+                    <button type="button" disabled={asking} onClick={() => loadNextPart()} className="mt-4 rounded-lg border border-slate-700 px-4 py-2 text-sm disabled:opacity-50">
+                      Next part ({response.full_document.next_part}/{response.full_document.total_parts})
+                    </button>
+                  )}
                 </div>
 
                 {/* UPLOADED IMAGE ANALYSIS */}
@@ -817,7 +899,7 @@ export default function Home() {
                       <h3 className="text-sm font-medium text-slate-300">Image information</h3>
                       <p className="mt-1 text-xs text-slate-500">Visual analysis and OCR extracted from your uploaded image</p>
                     </div>
-                    <div className="whitespace-pre-wrap text-sm leading-6 text-slate-400">{response.image_analysis}</div>
+                    <ResponseMarkdown>{response.image_analysis}</ResponseMarkdown>
                   </div>
                 )}
 

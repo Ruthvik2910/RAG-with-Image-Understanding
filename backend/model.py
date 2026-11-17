@@ -60,4 +60,5 @@ llm_model = ChatGroq(
 
 embed_model = GoogleGenerativeAIEmbeddings(
     model=EMBEDDING_MODEL,
+    google_api_key=os.getenv("GOOGLE_API_KEY"),
 )

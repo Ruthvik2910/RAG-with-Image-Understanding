@@ -22,3 +22,12 @@ langchain-groq
 python-multipart
 
 Pillow
+
+# API integration and faithful extraction
+python-docx
+charset-normalizer
+PyMuPDF
+pytesseract
+httpx
+langchain-core
+langchain-text-splitters

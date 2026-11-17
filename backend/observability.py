@@ -236,13 +236,13 @@ def calculate_observability_summary(
     local_route_count = sum(
         1
         for record in records
-        if record.get("route") == "vectorstore"
+        if record.get("route") in {"vectorstore", "local", "metadata", "full", "summary"}
     )
 
     web_route_count = sum(
         1
         for record in records
-        if record.get("route") == "websearch"
+        if record.get("route") in {"websearch", "web"}
     )
 
     hitl_approved_count = sum(

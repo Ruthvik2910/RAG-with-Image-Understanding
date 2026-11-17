@@ -1,0 +1,20 @@
+# Active API dependencies; exact direct versions used during verification.
+fastapi==0.141.1
+uvicorn==0.52.1
+pydantic==2.14.3
+python-dotenv==1.2.2
+python-multipart==0.0.32
+langchain-core==1.8.1
+langgraph==1.2.22
+langchain-groq==1.2.0
+langchain-google-genai==4.5.0
+langchain-chroma==1.1.0
+tavily-python==0.8.5
+pypdf==6.21.4
+python-docx==1.2.0
+charset-normalizer==3.5.2
+PyMuPDF==1.26.6
+pytesseract==0.3.13
+Pillow==13.0.0
+httpx==0.28.1
+pytest==9.2.0

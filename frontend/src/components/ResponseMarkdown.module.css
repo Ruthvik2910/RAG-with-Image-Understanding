@@ -1,0 +1,90 @@
+/* Scoped to generated chat responses; the surrounding interface is unchanged. */
+.response {
+  min-width: 0;
+  max-width: 100%;
+  color: #cbd5e1;
+  font-family: inherit;
+  font-size: 0.875rem;
+  line-height: 1.75;
+  overflow-wrap: anywhere;
+}
+
+.response > :first-child { margin-top: 0; }
+.response > :last-child { margin-bottom: 0; }
+.response p { margin-block: 0.75rem; }
+.response :is(h1, h2, h3, h4, h5, h6) {
+  margin-block: 1.25rem 0.5rem;
+  color: #f1f5f9;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.response h1 { font-size: 1.375rem; }
+.response h2 { font-size: 1.2rem; }
+.response h3 { font-size: 1.05rem; }
+.response strong { color: #e2e8f0; font-weight: 600; }
+.response em { font-style: italic; }
+.response :is(ul, ol) { margin-block: 0.75rem; padding-left: 1.5rem; }
+.response ul { list-style-type: disc; }
+.response ol { list-style-type: decimal; }
+.response li { margin-block: 0.25rem; }
+.response a { color: #93c5fd; text-decoration: underline; text-underline-offset: 3px; }
+.response a:hover { color: #bfdbfe; }
+.response blockquote { margin-block: 1rem; border-left: 3px solid #475569; padding-left: 1rem; color: #94a3b8; }
+.response hr { margin-block: 1.25rem; border-color: #334155; }
+
+.response code {
+  border-radius: 0.25rem;
+  background: #1e293b;
+  padding: 0.125rem 0.3rem;
+  color: #e2e8f0;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 0.9em;
+  white-space: break-spaces;
+}
+.response pre {
+  max-width: 100%;
+  overflow-x: auto;
+  margin-block: 1rem;
+  border: 1px solid #334155;
+  border-radius: 0.5rem;
+  background: #020617;
+  padding: 1rem;
+  line-height: 1.6;
+  overflow-wrap: normal;
+}
+.response pre code { display: block; padding: 0; background: transparent; white-space: pre; }
+
+.tableScroll {
+  max-width: 100%;
+  overflow-x: auto;
+  margin-block: 1rem;
+  border: 1px solid #334155;
+  border-radius: 0.5rem;
+  -webkit-overflow-scrolling: touch;
+}
+.tableScroll:focus-visible { outline: 2px solid #93c5fd; outline-offset: 2px; }
+.tableScroll table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: inherit;
+  line-height: 1.6;
+}
+.tableScroll :is(th, td) {
+  min-width: 8rem;
+  border-right: 1px solid #334155;
+  border-bottom: 1px solid #334155;
+  padding: 0.75rem 1rem;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.tableScroll th { background: #1e293b; color: #f1f5f9; font-weight: 600; }
+.tableScroll td { background: #020617; }
+.tableScroll tbody tr:nth-child(even) td { background: #0f172a; }
+.tableScroll tr > :last-child { border-right: 0; }
+.tableScroll tbody tr:last-child td { border-bottom: 0; }
+/* Do not set th/td text-align here: GFM's left/center/right inline styles win. */
+
+.response :global(.katex-display) { max-width: 100%; overflow-x: auto; overflow-y: hidden; padding-block: 0.25rem; }
+.response :global(.katex) { font-size: 1.05em; }

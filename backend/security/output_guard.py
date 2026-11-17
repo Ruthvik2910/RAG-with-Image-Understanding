@@ -25,6 +25,8 @@ class OutputGuardResult:
 
 def sanitize_output(
     output: str,
+    *,
+    truncate: bool = True,
 ) -> OutputGuardResult:
     """
     Detect and redact common secrets from model output.
@@ -68,7 +70,7 @@ def sanitize_output(
         redactions += count
 
     # Avoid returning unexpectedly huge model output.
-    if len(text) > MAX_OUTPUT_LENGTH:
+    if truncate and len(text) > MAX_OUTPUT_LENGTH:
         text = (
             text[:MAX_OUTPUT_LENGTH]
             + "\n\n[Output truncated by security policy.]"

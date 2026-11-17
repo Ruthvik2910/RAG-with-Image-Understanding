@@ -1,1604 +1,396 @@
+"""FastAPI integration for scoped, durable multimodal RAG.
+
+The files explicitly protected by the project owner are not modified. The API
+uses the integration workflow in orchestration.py; the legacy graph is retained.
+"""
 from __future__ import annotations
-
-import io
-import uuid
+import hashlib
+import hmac
 import logging
-
-import json
-import zipfile
 import os
-import shutil
-import tempfile
+import secrets
+import time
+import uuid
 from pathlib import Path
-from time import perf_counter
-from typing import Any, Dict, List, Optional
-
-from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from typing import Any
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from langgraph.types import Command
+from fastapi.concurrency import run_in_threadpool
+from pydantic import BaseModel, Field
+from backend import runtime_settings as settings
+from backend.repository import Repository
+from backend.file_processing import extract_file, FileValidationError, validate_image
+from backend.orchestration import Orchestrator, document_part, harmful, metadata_answer, intent_for, REFUSAL, SYSTEM
+from backend.integrations import ServiceUnavailable
+from backend.security.prompt_guard import check_prompt
+from backend.security.output_guard import sanitize_output
+from backend.evaluation import EvaluationTracker, EvaluationResult
+from backend.observability import RunObserver, load_observability_history, calculate_observability_summary, clear_observability_history
 
-from backend.evaluation import EvaluationResult, EvaluationTracker
-from backend.ingestion import (
-    SUPPORTED_EXTENSIONS,
-    build_vectorstore,
-    delete_document,
-    list_documents,
-)
-
-from backend.observability import (
-    RunObserver,
-    OBSERVABILITY_FILE,
-    load_observability_history,
-    calculate_observability_summary,
-    clear_observability_history,
-)
-
-from backend.graph.graph import app as rag_app
-from backend.image_search import answer_image_question, process_uploaded_image
-
-
-load_dotenv()
-
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-FRONTEND_URL = os.getenv(
-    "FRONTEND_URL",
-    "http://localhost:3000",
-)
-
-MAX_UPLOAD_SIZE_MB = int(
-    os.getenv("MAX_UPLOAD_SIZE_MB", "25")
-)
-
-MAX_UPLOAD_SIZE_BYTES = (
-    MAX_UPLOAD_SIZE_MB * 1024 * 1024
-)
-
-OBSERVABILITY_FILE = Path(
-    "./observability_history.jsonl"
-)
-
-
-# ============================================================================
-# FASTAPI
-# ============================================================================
-
-api = FastAPI(
-    title="Agentic Adaptive RAG API",
-    description=(
-        "Agentic RAG backend with adaptive routing, "
-        "document ingestion, HITL web-search approval, "
-        "observability, security and evaluation."
-    ),
-    version="1.0.0",
-)
-
-# Alias retained for compatibility.
+logger = logging.getLogger(__name__)
+repository = Repository()
+rag_service = Orchestrator(repository)
+api = FastAPI(title='Agentic Adaptive RAG API', version='2.0.0')
 app = api
+api.add_middleware(CORSMiddleware, allow_origins=settings.ALLOWED_ORIGINS,
+                   allow_credentials=True, allow_methods=['GET', 'POST', 'DELETE', 'OPTIONS'],
+                   allow_headers=['Content-Type', 'X-Legacy-Import-Key'])
 
 
-api.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        FRONTEND_URL,
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ============================================================================
-# REQUEST MODELS
-# ============================================================================
+@api.middleware('http')
+async def scoped_session(request: Request, call_next):
+    from starlette.responses import JSONResponse
+    origin = request.headers.get('origin')
+    if request.method not in {'GET', 'HEAD', 'OPTIONS'} and origin and origin not in settings.ALLOWED_ORIGINS:
+        return JSONResponse({'detail': 'This origin is not authorized.'}, status_code=403)
+    cookie = request.cookies.get(settings.COOKIE_NAME, '')
+    scope, _, signature = cookie.partition('.')
+    valid = (len(scope) == 64 and all(c in '0123456789abcdef' for c in scope) and
+             hmac.compare_digest(signature, hmac.new(repository.secret(), scope.encode(), hashlib.sha256).hexdigest()))
+    if not valid:
+        scope = secrets.token_hex(32)
+    request.state.scope = scope
+    response = await call_next(request)
+    response.headers['Cache-Control'] = 'no-store'
+    if not valid:
+        signature = hmac.new(repository.secret(), scope.encode(), hashlib.sha256).hexdigest()
+        response.set_cookie(settings.COOKIE_NAME, scope + '.' + signature, httponly=True,
+                            secure=settings.COOKIE_SECURE, samesite=settings.COOKIE_SAMESITE,
+                            max_age=365 * 86400)
+    return response
 
 
 class ChatRequest(BaseModel):
-    question: str
-    thread_id: Optional[str] = None
-
+    question: str = Field(min_length=1, max_length=4000)
+    thread_id: str | None = None
 
 class HITLRequest(BaseModel):
-    thread_id: str
+    thread_id: str = Field(min_length=1, max_length=128)
     approved: bool
 
 
-# ============================================================================
-# GENERAL HELPERS
-# ============================================================================
+def logs(scope):
+    root = repository.root / 'sessions' / scope
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
-def safe_str(value: Any) -> str:
-    if value is None:
-        return ""
-
-    return str(value)
-
-
-def safe_int(
-    value: Any,
-    default: int = 0,
-) -> int:
-
+def record(question, result, latency, scope, error=''):
     try:
-        return int(value)
-
-    except (TypeError, ValueError):
-        return default
-
-
-def safe_bool(
-    value: Any,
-    default: bool = False,
-) -> bool:
-
-    if value is None:
-        return default
-
-    if isinstance(value, bool):
-        return value
-
-    if isinstance(value, str):
-        return value.lower() in {
-            "true",
-            "1",
-            "yes",
-            "y",
-        }
-
-    return bool(value)
-
-
-def normalise_route(
-    result: Dict[str, Any],
-) -> str:
-
-    route = result.get("route")
-
-    if route:
-
-        route = str(route)
-
-        if route == "vectorstore":
-            return "local"
-
-        if route == "websearch":
-            return "web"
-
-        return route
-
-    if result.get("web_search") is True:
-        return "web"
-
-    return "unknown"
-
-
-def get_thread_id(
-    thread_id: Optional[str],
-) -> str:
-
-    if thread_id:
-        return thread_id
-
-    return "default"
-
-
-# ============================================================================
-# EVALUATION HELPERS
-# ============================================================================
-
-
-def build_evaluation_result(
-    question: str,
-    result: Dict[str, Any],
-    latency_seconds: float,
-    error: str = "",
-) -> EvaluationResult:
-
-    answer = safe_str(
-        result.get(
-            "answer",
-            result.get(
-                "generation",
-                "",
-            ),
-        )
-    )
-
-    documents = result.get(
-        "documents",
-        [],
-    ) or []
-
-    retrieved_documents = safe_int(
-        result.get(
-            "retrieved_documents",
-            len(documents),
-        )
-    )
-
-    relevant_documents = safe_int(
-        result.get(
-            "relevant_documents",
-            0,
-        )
-    )
-
-    return EvaluationResult(
-        question=question,
-        answer=answer,
-        route=normalise_route(result),
-        retrieved_documents=retrieved_documents,
-        relevant_documents=relevant_documents,
-        grounded=safe_bool(
-            result.get(
-                "grounded",
-                False,
-            )
-        ),
-        answers_question=safe_bool(
-            result.get(
-                "answers_question",
-                False,
-            )
-        ),
-        retry_count=safe_int(
-            result.get(
-                "retry_count",
-                0,
-            )
-        ),
-        latency_seconds=round(
-            latency_seconds,
-            4,
-        ),
-        sources=result.get(
-            "sources",
-            [],
-        )
-        or [],
-        error=error,
-    )
-
-
-def record_evaluation(
-    question: str,
-    result: Dict[str, Any],
-    latency_seconds: float,
-    error: str = "",
-) -> None:
-
-    try:
-
-        tracker = EvaluationTracker()
-
-        evaluation_result = (
-            build_evaluation_result(
-                question=question,
-                result=result,
-                latency_seconds=latency_seconds,
-                error=error,
-            )
-        )
-
-        tracker.add(
-            evaluation_result
-        )
-
-    except Exception as exc:
-
-        # Evaluation must never break the
-        # actual RAG application.
-        print(
-            "WARNING: Evaluation recording failed:",
-            str(exc),
-        )
-
-
-# ============================================================================
-# OBSERVABILITY HELPERS
-# ============================================================================
-
-
-def load_observability_history() -> List[Dict[str, Any]]:
-
-    if not OBSERVABILITY_FILE.exists():
-        return []
-
-    records: List[Dict[str, Any]] = []
-
-    try:
-
-        with open(
-            OBSERVABILITY_FILE,
-            "r",
-            encoding="utf-8",
-        ) as file:
-
-            for line in file:
-
-                line = line.strip()
-
-                if not line:
-                    continue
-
-                try:
-
-                    record = json.loads(line)
-
-                    if isinstance(
-                        record,
-                        dict,
-                    ):
-                        records.append(record)
-
-                except json.JSONDecodeError:
-
-                    continue
-
+        root = logs(scope)
     except OSError:
-
-        return []
-
-    return records
-
-
-def clear_observability_history() -> None:
-
-    if OBSERVABILITY_FILE.exists():
-        OBSERVABILITY_FILE.unlink()
-
-
-def calculate_observability_summary(
-    records: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-
-    total_runs = len(records)
-
-    if total_runs == 0:
-
-        return {
-            "total_runs": 0,
-            "successful_runs": 0,
-            "failed_runs": 0,
-            "success_rate": 0.0,
-            "average_latency_seconds": 0.0,
-            "average_retries": 0.0,
-            "grounded_rate": 0.0,
-            "answer_quality_rate": 0.0,
-            "local_route_count": 0,
-            "web_route_count": 0,
-            "hitl_approved_count": 0,
-            "hitl_rejected_count": 0,
-        }
-
-    successful_runs = sum(
-        1
-        for record in records
-        if bool(
-            record.get(
-                "success",
-                False,
-            )
-        )
-    )
-
-    failed_runs = (
-        total_runs - successful_runs
-    )
-
-    latencies = [
-        float(
-            record.get(
-                "latency_seconds",
-                0.0,
-            )
-            or 0.0
-        )
-        for record in records
-    ]
-
-    retries = [
-        float(
-            record.get(
-                "retry_count",
-                0,
-            )
-            or 0
-        )
-        for record in records
-    ]
-
-    grounded_count = sum(
-        1
-        for record in records
-        if bool(
-            record.get(
-                "grounded",
-                False,
-            )
-        )
-    )
-
-    answer_quality_count = sum(
-        1
-        for record in records
-        if bool(
-            record.get(
-                "answers_question",
-                False,
-            )
-        )
-    )
-
-    local_route_count = sum(
-        1
-        for record in records
-        if str(
-            record.get(
-                "route",
-                "",
-            )
-        ).lower()
-        in {
-            "local",
-            "vectorstore",
-        }
-    )
-
-    web_route_count = sum(
-        1
-        for record in records
-        if str(
-            record.get(
-                "route",
-                "",
-            )
-        ).lower()
-        in {
-            "web",
-            "websearch",
-        }
-    )
-
-    hitl_approved_count = sum(
-        1
-        for record in records
-        if str(
-            record.get(
-                "hitl_status",
-                "",
-            )
-        ).lower()
-        == "approved"
-    )
-
-    hitl_rejected_count = sum(
-        1
-        for record in records
-        if str(
-            record.get(
-                "hitl_status",
-                "",
-            )
-        ).lower()
-        == "rejected"
-    )
-
-    return {
-        "total_runs": total_runs,
-        "successful_runs": successful_runs,
-        "failed_runs": failed_runs,
-        "success_rate": (
-            successful_runs / total_runs
-        ),
-        "average_latency_seconds": (
-            sum(latencies) / len(latencies)
-            if latencies
-            else 0.0
-        ),
-        "average_retries": (
-            sum(retries) / len(retries)
-            if retries
-            else 0.0
-        ),
-        "grounded_rate": (
-            grounded_count / total_runs
-        ),
-        "answer_quality_rate": (
-            answer_quality_count / total_runs
-        ),
-        "local_route_count": local_route_count,
-        "web_route_count": web_route_count,
-        "hitl_approved_count": hitl_approved_count,
-        "hitl_rejected_count": hitl_rejected_count,
-    }
-
-
-# ============================================================================
-# ROOT / HEALTH
-# ============================================================================
-
-
-@api.get("/")
-def root() -> Dict[str, str]:
-
-    return {
-        "name": "Agentic Adaptive RAG API",
-        "status": "running",
-    }
-
-
-@api.get("/health")
-def health() -> Dict[str, Any]:
-
+        logger.exception('Could not open scoped metrics directory')
+        return
+    fields = {k: result.get(k, default) for k, default in {
+        'route': 'unknown', 'retrieved_documents': 0, 'relevant_documents': 0,
+        'grounded': None, 'answers_question': None, 'retry_count': 0,
+        'sources': [], 'hitl_status': '', 'hitl_reason': '',
+    }.items()}
+    # Observability includes approval pauses and final attempts. Keep it separate
+    # from completed/failed evaluation records, and isolate write failures.
     try:
-
-        documents = list_documents()
-
-        return {
-            "status": "healthy",
-            "documents": len(documents),
-            "evaluation_enabled": True,
-            "observability_enabled": True,
-        }
-
-    except Exception as exc:
-
-        return {
-            "status": "degraded",
-            "error": str(exc),
-            "evaluation_enabled": True,
-            "observability_enabled": True,
-        }
-
-
-# ============================================================================
-# DOCUMENT MANAGEMENT
-# ============================================================================
-
-
-def validate_uploaded_content(
-    filename: str,
-    contents: bytes,
-) -> tuple[bool, str]:
-    """
-    Validate uploaded content using the file extension and
-    basic content signatures/structure.
-
-    This is intentionally conservative. It is not a malware
-    scanner; it prevents obvious extension/content mismatches
-    and malformed supported document types.
-    """
-
-    extension = Path(filename).suffix.lower()
-
-    if extension not in SUPPORTED_EXTENSIONS:
-        return False, (
-            f"Unsupported file type: "
-            f"{extension or 'unknown'}"
-        )
-
-    if extension == ".pdf":
-        if not contents.startswith(b"%PDF-"):
-            return False, (
-                "File does not contain a valid PDF signature."
-            )
-
-        return True, ""
-
-    if extension == ".docx":
-        if not contents.startswith(b"PK"):
-            return False, (
-                "File does not contain a valid DOCX/ZIP signature."
-            )
-
-        try:
-            with zipfile.ZipFile(
-                io.BytesIO(contents)
-            ) as archive:
-                names = set(archive.namelist())
-
-                required_files = {
-                    "[Content_Types].xml",
-                    "word/document.xml",
-                }
-
-                if not required_files.issubset(names):
-                    return False, (
-                        "File does not contain the required DOCX structure."
-                    )
-
-        except zipfile.BadZipFile:
-            return False, (
-                "File is not a valid DOCX archive."
-            )
-
-        return True, ""
-
-    if extension in {".txt", ".md"}:
-        if b"\x00" in contents:
-            return False, (
-                "Text file contains binary data."
-            )
-
-        try:
-            contents.decode("utf-8")
-        except UnicodeDecodeError:
-            return False, (
-                "Text file is not valid UTF-8."
-            )
-
-        return True, ""
-
-    return False, (
-        f"Unsupported file type: {extension}"
-    )
-
-
-
-@api.get("/documents")
-def get_documents() -> Dict[str, Any]:
-
+        RunObserver(question, storage_path=root / 'observability.jsonl').record(
+            **fields, latency_seconds=latency, success=not bool(error) and result.get('success') is not False and result.get('status') != 'failed', error=error)
+    except Exception:
+        logger.exception('Could not record scoped observability metrics')
+    if result.get('status') == 'approval_required' or result.get('hitl_status') == 'pending':
+        return
     try:
-
-        documents = list_documents()
-
-        return {
-            "documents": documents,
-            "count": len(documents),
-        }
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Failed to load documents: "
-                f"{exc}"
-            ),
-        )
+        fields.pop('hitl_status')
+        fields.pop('hitl_reason')
+        # These routes do not run the RAG grounding/answer graders. Their
+        # execution can succeed without implying a passed quality assessment.
+        if result.get('route') in {'direct', 'image', 'summary', 'security_blocked'}:
+            fields['grounded'] = None
+            fields['answers_question'] = None
+        EvaluationTracker(root / 'evaluation.jsonl').add(EvaluationResult(
+            question=question, answer=result.get('answer', ''), **fields,
+            latency_seconds=latency, error=error, request_id=result.get('thread_id', ''),
+            status='failed' if error else result.get('status', 'completed'),
+            execution_success=result.get('success')))
+    except Exception:
+        logger.exception('Could not record scoped evaluation metrics')
 
 
-@api.post("/upload")
-async def upload_documents(
-    files: List[UploadFile] = File(...),
-) -> Dict[str, Any]:
+def payload(result, thread_id, latency=0):
+    data = {k: v for k, v in result.items() if k not in {'__interrupt__', 'scope', 'documents', 'blocked'}}
+    interrupts = result.get('__interrupt__') or []
+    data.update(status='approval_required' if interrupts else 'completed', thread_id=thread_id,
+                generation=result.get('answer', ''), latency_seconds=round(latency, 4))
+    if interrupts:
+        data.update(hitl_status='pending', hitl_reason=interrupts[0].value['message'], hitl=interrupts[0].value)
+    return data
 
-    if not files:
-        raise HTTPException(
-            status_code=400,
-            detail="No files were provided.",
-        )
 
-    max_files = 5
+def owned_document(scope, identifier):
+    row = repository.get(scope, identifier)
+    if row is None:
+        raise HTTPException(404, 'Document not found in this session.')
+    return row
 
-    if len(files) > max_files:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Maximum {max_files} files are allowed "
-                "per upload request."
-            ),
-        )
 
-    uploaded: List[Dict[str, Any]] = []
-    rejected: List[Dict[str, Any]] = []
-    temp_paths: List[str] = []
+@api.get('/')
+def root():
+    return {'name': 'Agentic Adaptive RAG API', 'status': 'running'}
 
+@api.get('/health')
+def health():
+    # Liveness is independent of external credentials; report their presence, never values.
+    return {'status': 'healthy', 'evaluation_enabled': True, 'observability_enabled': True,
+            'configured_services': {name: bool(os.getenv(name)) for name in ('GROQ_API_KEY', 'GOOGLE_API_KEY', 'TAVILY_API_KEY')}}
+
+@api.get('/config')
+def configuration():
+    return {'upload_limits': {ext: {'max_bytes': limit, 'max_mb': limit / settings.MIB} for ext, limit in settings.UPLOAD_LIMITS.items()},
+            'max_files': settings.MAX_FILES, 'image_max_bytes': settings.IMAGE_LIMIT,
+            'web_search_requires_approval': settings.WEB_APPROVAL,
+            'legacy_import_available': bool(os.getenv('LEGACY_IMPORT_KEY')) and Path(os.getenv('CHROMA_PATH', './.chroma'), 'chroma.sqlite3').is_file()}
+
+@api.get('/documents')
+def get_documents(request: Request):
+    documents = repository.list(request.state.scope)
+    return {'documents': documents, 'count': len(documents)}
+
+@api.post('/documents/import-legacy')
+def import_legacy(request: Request):
+    expected = os.getenv('LEGACY_IMPORT_KEY', '')
+    supplied = request.headers.get('X-Legacy-Import-Key', '')
+    if not expected or not supplied or not hmac.compare_digest(expected, supplied):
+        raise HTTPException(403, 'Configure LEGACY_IMPORT_KEY and supply the administrator import key.')
+    from backend.legacy_recovery import recover_legacy
+    source = Path(os.getenv('CHROMA_PATH', './.chroma')) / 'chroma.sqlite3'
+    if not source.is_file():
+        raise HTTPException(404, 'No legacy database was found.')
     try:
-        for uploaded_file in files:
-            original_filename = uploaded_file.filename or ""
-
-            if not original_filename:
-                rejected.append(
-                    {
-                        "file_name": "",
-                        "reason": "Missing filename.",
-                    }
-                )
-                continue
-
-            normalized_filename = original_filename.replace(
-                "\\",
-                "/",
-            )
-            filename = Path(normalized_filename).name
-
-            if not filename or filename in {".", ".."}:
-                rejected.append(
-                    {
-                        "file_name": original_filename,
-                        "reason": "Invalid filename.",
-                    }
-                )
-                continue
-
-            extension = Path(filename).suffix.lower()
-
-            if extension not in SUPPORTED_EXTENSIONS:
-                rejected.append(
-                    {
-                        "file_name": filename,
-                        "reason": (
-                            "Unsupported file type. Supported types: "
-                            + ", ".join(sorted(SUPPORTED_EXTENSIONS))
-                        ),
-                    }
-                )
-                continue
-
-            contents = await uploaded_file.read(
-                MAX_UPLOAD_SIZE_BYTES + 1
-            )
-
-            if len(contents) > MAX_UPLOAD_SIZE_BYTES:
-                rejected.append(
-                    {
-                        "file_name": filename,
-                        "reason": (
-                            f"File exceeds the {MAX_UPLOAD_SIZE_MB} MB limit."
-                        ),
-                    }
-                )
-                await uploaded_file.close()
-                continue
-
-            if not contents:
-                rejected.append(
-                    {
-                        "file_name": filename,
-                        "reason": "File is empty.",
-                    }
-                )
-                await uploaded_file.close()
-                continue
-
-            valid, validation_reason = validate_uploaded_content(
-                filename,
-                contents,
-            )
-
-            if not valid:
-                rejected.append(
-                    {
-                        "file_name": filename,
-                        "reason": validation_reason,
-                    }
-                )
-                await uploaded_file.close()
-                continue
-
-            temp_dir = tempfile.mkdtemp(
-                prefix="agentic_rag_"
-            )
-
-            safe_filename = Path(filename).name
-            temp_path = os.path.join(
-                temp_dir,
-                safe_filename,
-            )
-
-            with open(temp_path, "wb") as output_file:
-                output_file.write(contents)
-
-            temp_paths.append(temp_path)
-
-            uploaded.append(
-                {
-                    "file_name": filename,
-                    "temp_path": temp_path,
-                    "size_bytes": len(contents),
-                    "extension": extension,
-                }
-            )
-
-            await uploaded_file.close()
-
-        if not uploaded:
-            rejection_details = "; ".join(
-                f"{item['file_name'] or 'File'}: {item['reason']}"
-                for item in rejected
-            )
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "No valid files were uploaded."
-                    + (f" {rejection_details}" if rejection_details else "")
-                ),
-            )
-
-        build_vectorstore(
-            [
-                item["temp_path"]
-                for item in uploaded
-            ]
-        )
-
-        return {
-            "message": (
-                f"Successfully processed {len(uploaded)} file(s)."
-            ),
-            "uploaded": [
-                {
-                    "file_name": item["file_name"],
-                    "size_bytes": item["size_bytes"],
-                    "extension": item["extension"],
-                }
-                for item in uploaded
-            ],
-            "rejected": rejected,
-            "documents": list_documents(),
-        }
-
-    except HTTPException:
-        raise
-
+        files = recover_legacy(repository, request.state.scope, source)
+        return {'message': f'Recovered metadata for {len(files)} document(s). Reupload original files for exact text and complete summaries, then retry indexing.',
+                'recovered': files, 'documents': repository.list(request.state.scope)}
     except Exception as exc:
-        logging.exception("Document upload failed during ingestion.")
-        raise HTTPException(
-            status_code=500,
-            detail="Upload failed while processing the documents.",
-        ) from exc
+        logger.exception('Legacy recovery failed')
+        raise HTTPException(422, 'The legacy database could not be read; reupload your original documents.') from exc
 
-    finally:
-        for temp_path in temp_paths:
+@api.get('/documents/{document_id}/text')
+def get_document_text(document_id: str, request: Request, part: int = Query(1, ge=1)):
+    row = owned_document(request.state.scope, document_id)
+    if not row['extraction_complete']:
+        raise HTTPException(409, 'Original text is unavailable for this legacy file. Reupload the original for exact text.')
+    try:
+        return document_part(row, part)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+@api.post('/documents/{document_id}/index')
+def retry_index(document_id: str, request: Request):
+    row = owned_document(request.state.scope, document_id)
+    try:
+        count = rag_service.index.add(row)
+        repository.mark_indexed(request.state.scope, document_id, count)
+        return {'message': 'Document indexed.', 'document_id': document_id, 'chunk_count': count}
+    except ServiceUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+@api.delete('/documents/{document_id}')
+def remove_document(document_id: str, request: Request):
+    owned_document(request.state.scope, document_id)
+    try:
+        rag_service.index.delete(request.state.scope, document_id)
+        repository.delete(request.state.scope, document_id)
+        return {'message': 'Document deleted.', 'document_id': document_id}
+    except Exception as exc:
+        logger.exception('Deletion failed')
+        raise HTTPException(503, 'Could not delete the document index. Please retry.') from exc
+
+@api.post('/upload')
+async def upload_documents(request: Request, files: list[UploadFile] = File(...)):
+    uploaded, rejected, statuses = [], [], []
+    try:
+        if len(files) > settings.MAX_FILES:
+            raise HTTPException(400, f'Upload at most {settings.MAX_FILES} files at once.')
+        for file in files:
+            filename = (file.filename or '').replace('\\', '/').rsplit('/', 1)[-1]
+            ext = Path(filename).suffix.lower()
             try:
-                temp_dir = os.path.dirname(temp_path)
-
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-
-                if os.path.isdir(temp_dir):
-                    shutil.rmtree(
-                        temp_dir,
-                        ignore_errors=True,
-                    )
-
-            except OSError:
-                pass
-
-
-@api.delete(
-    "/documents/{document_id}"
-)
-def remove_document(
-    document_id: str,
-) -> Dict[str, Any]:
-
-    try:
-
-        deleted = delete_document(
-            document_id
-        )
-
-        if not deleted:
-
-            raise HTTPException(
-                status_code=404,
-                detail="Document not found.",
-            )
-
-        return {
-            "message": "Document deleted.",
-            "document_id": document_id,
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Failed to delete document: "
-                f"{exc}"
-            ),
-        )
+                if not filename or len(filename) > 200 or any(ord(c) < 32 for c in filename):
+                    raise HTTPException(400, 'Invalid filename.')
+                if ext not in settings.UPLOAD_LIMITS:
+                    raise HTTPException(415, 'Unsupported file type. Supported: PDF, DOCX, TXT, MD.')
+                limit = settings.UPLOAD_LIMITS[ext]
+                if file.size is not None and file.size > limit:
+                    raise HTTPException(413, size_error(ext, file.size, limit))
+                data = await file.read(limit + 1)
+                if len(data) > limit:
+                    raise HTTPException(413, size_error(ext, file.size or len(data), limit))
+                extracted = await run_in_threadpool(extract_file, filename, data, file.content_type)
+                doc, duplicate = await run_in_threadpool(repository.put, request.state.scope, filename, data, extracted)
+                if doc['status'] != 'ready':
+                    row = repository.get(request.state.scope, doc['document_id'])
+                    try:
+                        count = await run_in_threadpool(rag_service.index.add, row)
+                        repository.mark_indexed(request.state.scope, doc['document_id'], count)
+                        doc['status'], doc['chunk_count'] = 'ready', count
+                    except ServiceUnavailable as exc:
+                        raise HTTPException(503, str(exc) + f" Document '{filename}' is saved and can be displayed in full.") from exc
+                uploaded.append({**doc, 'duplicate': duplicate})
+            except (HTTPException, FileValidationError, ValueError) as exc:
+                status = exc.status_code if isinstance(exc, HTTPException) else (422 if isinstance(exc, FileValidationError) else 409)
+                message = exc.detail if isinstance(exc, HTTPException) else str(exc)
+                rejected.append({'file_name': filename, 'reason': message})
+                statuses.append(status)
+            except Exception:
+                logger.exception('Unexpected upload failure for %r', filename)
+                rejected.append({'file_name': filename, 'reason': 'Document processing failed. Check backend logs and retry.'})
+                statuses.append(500)
+        if not uploaded:
+            raise HTTPException(statuses[0] if statuses else 400,
+                                '; '.join(f"{r['file_name']}: {r['reason']}" for r in rejected) or 'No files were uploaded.')
+        return {'message': f'Processed {len(uploaded)} file(s).', 'uploaded': uploaded, 'rejected': rejected,
+                'documents': repository.list(request.state.scope)}
+    finally:
+        for file in files:
+            await file.close()
 
 
-# ============================================================================
-# CHAT
-# ============================================================================
+def size_error(ext, size, limit):
+    return (f'File upload failed. The maximum allowed {ext[1:].upper()} size is {limit/settings.MIB:g} MB. '
+            f'Your uploaded file is {size/settings.MIB:.2f} MB. Please upload a smaller file.')
 
-
-@api.post("/chat/image")
-async def chat_with_image(
-    question: str = Form(""),
-    thread_id: Optional[str] = Form(None),
-    image: UploadFile = File(...),
-):
-    """Answer questions directly from a user-uploaded image.
-
-    Image understanding is the primary path. Related-image search is only
-    performed when the user explicitly asks to find/search/show similar images.
-    """
-    question = question.strip()
-    if not image.content_type or not image.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Only image files are accepted.")
-
-    contents = await image.read(MAX_UPLOAD_SIZE_BYTES + 1)
-    await image.close()
-
-    if len(contents) > MAX_UPLOAD_SIZE_BYTES:
-        raise HTTPException(status_code=400, detail=f"Image exceeds the {MAX_UPLOAD_SIZE_MB} MB limit.")
-    if not contents:
-        raise HTTPException(status_code=400, detail="Uploaded image is empty.")
-
-    if not question:
-        question = "Explain the uploaded image and identify its important content."
-
-    observer = RunObserver(question)
-    start_time = perf_counter()
-    active_thread_id = thread_id or str(uuid.uuid4())
-
-    
-    try:
-        from backend.image_search import (
-            answer_image_question,
-            search_related_images,
-        )
-
-        # One Gemini call for the normal image-question path.
-        answer = answer_image_question(
-            contents,
-            image.content_type,
-            question,
-        )
-
-        lower_question = question.lower()
-        wants_related_images = any(
-            phrase in lower_question
-            for phrase in (
-                "find similar images",
-                "find related images",
-                "show similar images",
-                "show related images",
-                "search for images",
-                "find images",
-                "related pictures",
-                "similar pictures",
-            )
-        )
-
-        related_images = []
-        image_search_query = ""
-
-        # Only perform extra analysis and web search when requested.
-        if wants_related_images:
-            from backend.image_search import analyze_image
-
-            image_analysis = analyze_image(
-                contents, image.content_type
-            )
-            image_search_query = f"{question}\n{image_analysis}"[:2500]
-            related_images = search_related_images(image_search_query)
-        else:
-            image_analysis = ""
-
-        latency = perf_counter() - start_time
-        observer.record(
-            route="image",
-            retrieved_documents=0,
-            relevant_documents=0,
-            grounded=True,
-            answers_question=True,
-            retry_count=0,
-            latency_seconds=latency,
-            sources=[],
-            success=True,
-            hitl_status="",
-            hitl_reason="",
-        )
-
-        result = {
-            "answer": answer,
-            "generation": answer,
-            "route": "image",
-            "sources": [],
-            "retrieved_documents": 0,
-            "relevant_documents": 0,
-            "grounded": True,
-            "answers_question": True,
-            "retry_count": 0,
-            "image_analysis": image_analysis,
-            "image_search_query": image_search_query,
-            "related_images": related_images,
-        }
-        record_evaluation(question, result, latency)
-
-        return {
-            "status": "completed",
-            "thread_id": active_thread_id,
-            "question": question,
-            "answer": answer,
-            "generation": answer,
-            "route": "image",
-            "sources": [],
-            "retrieved_documents": 0,
-            "relevant_documents": 0,
-            "grounded": True,
-            "answers_question": True,
-            "retry_count": 0,
-            "latency_seconds": round(latency, 4),
-            "hitl_status": None,
-            "hitl_reason": None,
-            "security_status": "passed",
-            "security_reason": "",
-            "security_redactions": 0,
-            "image_analysis": image_analysis,
-            "image_search_query": image_search_query,
-            "related_images": related_images,
-        }
-
-    except Exception as exc:
-        latency = perf_counter() - start_time
-        observer.record(route="image", latency_seconds=latency, success=False, error=str(exc))
-        logging.exception("Image question processing failed.")
-        raise HTTPException(
-            status_code=500,
-            detail="Unable to analyze the uploaded image and answer the question.",
-        ) from exc
-
-
-@api.post("/chat")
-async def chat(request: ChatRequest):
+@api.post('/chat')
+def chat(request: ChatRequest, http_request: Request):
     question = request.question.strip()
-
     if not question:
-        raise HTTPException(
-            status_code=400,
-            detail="Question cannot be empty.",
-        )
-
-    observer = RunObserver(question)
-    start_time = perf_counter()
-    thread_id = request.thread_id or str(uuid.uuid4())
-
+        raise HTTPException(400, 'Question cannot be empty.')
+    # Each invocation gets fresh state; caller-supplied IDs cannot reuse another run.
+    thread_id = str(uuid.uuid4())
+    scope = http_request.state.scope
+    start = time.perf_counter()
     try:
-        config = {
-            "configurable": {
-                "thread_id": thread_id,
-            }
-        }
-
-        result = rag_app.invoke(
-            {
-                "question": question,
-            },
-            config=config,
-        )
-
-        latency = perf_counter() - start_time
-        result = dict(result or {})
-
-        # LangGraph returns a __interrupt__ entry when the workflow
-        # pauses for human approval. This is a pending state, not a
-        # completed answer.
-        interrupts = result.get("__interrupt__") or []
-
-        if interrupts:
-            interrupt_value = getattr(
-                interrupts[0],
-                "value",
-                interrupts[0],
-            )
-
-            if not isinstance(interrupt_value, dict):
-                interrupt_value = {
-                    "type": "web_search_approval",
-                    "title": "Web search approval required",
-                    "message": str(interrupt_value),
-                }
-
-            route = normalise_route(result)
-
-            observer.record(
-                route=route,
-                retrieved_documents=safe_int(
-                    result.get("retrieved_documents", 0)
-                ),
-                relevant_documents=safe_int(
-                    result.get("relevant_documents", 0)
-                ),
-                grounded=False,
-                answers_question=False,
-                retry_count=safe_int(
-                    result.get("retry_count", 0)
-                ),
-                latency_seconds=latency,
-                sources=[],
-                success=True,
-                hitl_status="pending",
-                hitl_reason=safe_str(
-                    interrupt_value.get(
-                        "message",
-                        "Human approval is required before web search.",
-                    )
-                ),
-            )
-
-            return {
-                "status": "approval_required",
-                "thread_id": thread_id,
-                "question": question,
-                "answer": "",
-                "generation": "",
-                "route": "web",
-                "sources": [],
-                "retrieved_documents": safe_int(
-                    result.get("retrieved_documents", 0)
-                ),
-                "relevant_documents": safe_int(
-                    result.get("relevant_documents", 0)
-                ),
-                "grounded": False,
-                "answers_question": False,
-                "retry_count": safe_int(
-                    result.get("retry_count", 0)
-                ),
-                "latency_seconds": round(latency, 4),
-                "hitl_status": "pending",
-                "hitl_reason": safe_str(
-                    interrupt_value.get(
-                        "message",
-                        "Human approval is required before web search.",
-                    )
-                ),
-                "hitl": interrupt_value,
-                "security_status": result.get("security_status"),
-                "security_reason": result.get("security_reason"),
-                "security_redactions": result.get(
-                    "security_redactions", []
-                ) or [],
-            }
-
-        sources = result.get("sources", [])
-
-        observer.record(
-            route=str(
-                result.get(
-                    "route",
-                    "unknown",
-                )
-            ),
-            retrieved_documents=safe_int(
-                result.get(
-                    "retrieved_documents",
-                    0,
-                )
-            ),
-            relevant_documents=safe_int(
-                result.get(
-                    "relevant_documents",
-                    0,
-                )
-            ),
-            grounded=bool(
-                result.get(
-                    "grounded",
-                    False,
-                )
-            ),
-            answers_question=bool(
-                result.get(
-                    "answers_question",
-                    False,
-                )
-            ),
-            retry_count=int(
-                result.get(
-                    "retry_count",
-                    0,
-                )
-                or 0
-            ),
-            latency_seconds=latency,
-            sources=sources,
-            success=True,
-            hitl_status=str(
-                result.get(
-                    "hitl_status",
-                    "",
-                )
-                or ""
-            ),
-            hitl_reason=str(
-                result.get(
-                    "hitl_reason",
-                    "",
-                )
-                or ""
-            ),
-        )
-
-        record_evaluation(
-            question=question,
-            result=result,
-            latency_seconds=latency,
-        )
-
-        return {
-            "status": "completed",
-            "thread_id": thread_id,
-            "question": question,
-            "answer": safe_str(
-                result.get(
-                    "answer",
-                    result.get("generation", ""),
-                )
-            ),
-            "generation": safe_str(
-                result.get("generation", "")
-            ),
-            "route": normalise_route(result),
-            "sources": sources or [],
-            "retrieved_documents": safe_int(
-                result.get("retrieved_documents", len(result.get("documents", []) or []))
-            ),
-            "relevant_documents": safe_int(
-                result.get("relevant_documents", 0)
-            ),
-            "grounded": safe_bool(
-                result.get("grounded", False)
-            ),
-            "answers_question": safe_bool(
-                result.get("answers_question", False)
-            ),
-            "retry_count": safe_int(
-                result.get("retry_count", 0)
-            ),
-            "latency_seconds": round(latency, 4),
-            "hitl_status": result.get("hitl_status"),
-            "hitl_reason": result.get("hitl_reason"),
-            "security_status": result.get("security_status"),
-            "security_reason": result.get("security_reason"),
-            "security_redactions": result.get(
-                "security_redactions", []
-            ) or [],
-        }
-
+        result = rag_service.run(question, scope, thread_id)
+        if result.get('__interrupt__'):
+            repository.thread(scope, thread_id, time.time() + settings.APPROVAL_TTL)
+        else:
+            rag_service.forget(scope, thread_id)
+        result = payload(result, thread_id, time.perf_counter() - start)
+        record(question, result, time.perf_counter() - start, scope)
+        return result
+    except ServiceUnavailable as exc:
+        record(question, {'thread_id': thread_id}, time.perf_counter() - start, scope, str(exc))
+        raise HTTPException(503, str(exc)) from exc
+    except ValueError as exc:
+        record(question, {'thread_id': thread_id}, time.perf_counter() - start, scope, str(exc))
+        raise HTTPException(400, str(exc)) from exc
     except Exception as exc:
-        latency = perf_counter() - start_time
+        logger.exception('Chat execution failed')
+        record(question, {'thread_id': thread_id}, time.perf_counter() - start, scope, 'Chat execution failed')
+        raise HTTPException(503, 'The request could not be completed. Check service configuration and retry.') from exc
 
-        observer.record(
-            route="error",
-            latency_seconds=latency,
-            success=False,
-            error=str(exc),
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
-        )
-
-
-# ============================================================================
-# HITL APPROVAL
-# ============================================================================
-
-
-@api.post("/chat/approval")
-def chat_approval(
-    request: HITLRequest,
-) -> Dict[str, Any]:
-
-    thread_id = request.thread_id
-
-    if not thread_id:
-        raise HTTPException(
-            status_code=400,
-            detail="thread_id is required.",
-        )
-
-    start_time = perf_counter()
-
+@api.post('/chat/approval')
+def chat_approval(request: HITLRequest, http_request: Request):
+    scope = http_request.state.scope
+    expires = repository.thread_expiry(scope, request.thread_id)
+    if expires is None or expires < time.time():
+        raise HTTPException(409, 'Approval session is missing or expired. Ask the question again.')
+    config = rag_service.config(scope, request.thread_id)
+    snapshot = rag_service.graph.get_state(config)
+    if not snapshot.tasks:
+        raise HTTPException(409, 'Approval session ended or the server restarted. Ask the question again.')
+    if not repository.consume_thread(scope, request.thread_id):
+        raise HTTPException(409, 'This approval has already been handled.')
+    start = time.perf_counter()
     try:
-        config = {
-            "configurable": {
-                "thread_id": thread_id,
-            }
-        }
-
-        # IMPORTANT: an interrupted LangGraph workflow must be resumed
-        # with Command(resume=...), not with a normal state dictionary.
-        result = rag_app.invoke(
-            Command(resume=request.approved),
-            config=config,
-        )
-
-        latency = perf_counter() - start_time
-        result = dict(result or {})
-
-        # If another interrupt is returned, surface it to the client
-        # instead of pretending that an answer was completed.
-        interrupts = result.get("__interrupt__") or []
-
-        if interrupts:
-            interrupt_value = getattr(
-                interrupts[0],
-                "value",
-                interrupts[0],
-            )
-
-            if not isinstance(interrupt_value, dict):
-                interrupt_value = {
-                    "type": "web_search_approval",
-                    "title": "Web search approval required",
-                    "message": str(interrupt_value),
-                }
-
-            return {
-                "status": "approval_required",
-                "thread_id": thread_id,
-                "question": safe_str(result.get("question", "")),
-                "answer": "",
-                "generation": "",
-                "route": "web",
-                "sources": [],
-                "retrieved_documents": safe_int(
-                    result.get("retrieved_documents", 0)
-                ),
-                "relevant_documents": safe_int(
-                    result.get("relevant_documents", 0)
-                ),
-                "grounded": False,
-                "answers_question": False,
-                "retry_count": safe_int(
-                    result.get("retry_count", 0)
-                ),
-                "latency_seconds": round(latency, 4),
-                "hitl_status": "pending",
-                "hitl_reason": safe_str(
-                    interrupt_value.get(
-                        "message",
-                        "Human approval is required.",
-                    )
-                ),
-                "hitl": interrupt_value,
-                "security_status": result.get("security_status"),
-                "security_reason": result.get("security_reason"),
-                "security_redactions": result.get(
-                    "security_redactions", []
-                ) or [],
-            }
-
-        question = safe_str(
-            result.get(
-                "question",
-                "",
-            )
-        )
-
-        record_evaluation(
-            question=question,
-            result=result,
-            latency_seconds=latency,
-        )
-
-        return {
-            "status": "completed",
-            "thread_id": thread_id,
-            "question": question,
-            "answer": safe_str(
-                result.get(
-                    "answer",
-                    result.get(
-                        "generation",
-                        "",
-                    ),
-                )
-            ),
-            "generation": safe_str(
-                result.get(
-                    "generation",
-                    "",
-                )
-            ),
-            "route": normalise_route(
-                result
-            ),
-            "sources": result.get(
-                "sources",
-                [],
-            ) or [],
-            "retrieved_documents": safe_int(
-                result.get(
-                    "retrieved_documents",
-                    len(
-                        result.get(
-                            "documents",
-                            [],
-                        ) or []
-                    ),
-                )
-            ),
-            "relevant_documents": safe_int(
-                result.get(
-                    "relevant_documents",
-                    0,
-                )
-            ),
-            "grounded": safe_bool(
-                result.get(
-                    "grounded",
-                    False,
-                )
-            ),
-            "answers_question": safe_bool(
-                result.get(
-                    "answers_question",
-                    False,
-                )
-            ),
-            "retry_count": safe_int(
-                result.get(
-                    "retry_count",
-                    0,
-                )
-            ),
-            "latency_seconds": round(
-                latency,
-                4,
-            ),
-            "hitl_status": result.get(
-                "hitl_status"
-            ),
-            "hitl_reason": result.get(
-                "hitl_reason"
-            ),
-            "security_status": result.get(
-                "security_status"
-            ),
-            "security_reason": result.get(
-                "security_reason"
-            ),
-            "security_redactions": (
-                result.get(
-                    "security_redactions",
-                    [],
-                ) or []
-            ),
-            "image_analysis": result.get("image_analysis", ""),
-            "image_search_query": result.get("image_search_query", ""),
-            "related_images": result.get("related_images", []) or [],
-        }
-
+        result = rag_service.resume(scope, request.thread_id, request.approved)
+        rag_service.forget(scope, request.thread_id)
+        response = payload(result, request.thread_id, time.perf_counter() - start)
+        record(result.get('question', ''), response, time.perf_counter() - start, scope)
+        return response
+    except ServiceUnavailable as exc:
+        record(snapshot.values.get('question', ''), {'thread_id': request.thread_id}, time.perf_counter() - start, scope, str(exc))
+        raise HTTPException(503, str(exc) + ' Ask the question again to retry.') from exc
     except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
-        )
+        logger.exception('Approval resume failed')
+        record(snapshot.values.get('question', ''), {'thread_id': request.thread_id}, time.perf_counter() - start, scope, 'Approval resume failed')
+        raise HTTPException(503, 'Could not resume this request. Ask the question again.') from exc
 
-
-# ============================================================================
-# EVALUATION API
-# ============================================================================
-
-
-@api.get("/evaluation")
-def get_evaluation() -> Dict[str, Any]:
-
+@api.post('/chat/image')
+async def chat_with_image(request: Request, question: str = Form(''), thread_id: str | None = Form(None), image: UploadFile = File(...)):
+    from backend import image_search
+    question = question.strip() or 'Explain the uploaded image and identify its important content.'
+    active_thread = str(uuid.uuid4())
+    started = time.perf_counter()
+    checked = check_prompt(question)
     try:
-
-        tracker = EvaluationTracker()
-
-        return {
-            "results": [
-                result.to_dict()
-                for result in tracker.results
-            ],
-            "summary": tracker.summary(),
-        }
-
+        if not checked.allowed or harmful(question):
+            response = payload({'question': question, 'answer': REFUSAL if harmful(question) else "I can't process instruction-override requests.",
+                            'route': 'security_blocked', 'security_status': 'blocked', 'sources': []}, active_thread)
+            record(question, response, time.perf_counter() - started, request.state.scope)
+            return response
+        data = await image.read(settings.IMAGE_LIMIT + 1)
+        detected = await run_in_threadpool(validate_image, data, image.content_type)
+        blocked = await run_in_threadpool(rag_service.check_tool_safety, {'question': question})
+        if blocked:
+            response = payload(blocked, active_thread)
+            record(question, response, time.perf_counter() - started, request.state.scope)
+            return response
+        start = time.perf_counter()
+        answer = await run_in_threadpool(image_search.answer_image_question, data, detected, question)
+        guarded = sanitize_output(answer)
+        related = []
+        if any(p in question.lower() for p in ('find similar images', 'find related images', 'show similar images', 'search for images', 'find images')):
+            # Explicit image-search request authorizes read-only search. The text web
+            # approval configuration applies here too: direct users to the web route.
+            if settings.WEB_APPROVAL:
+                answer = guarded.output + '\n\nRelated image search requires a separate approved web-search request on this installation.'
+            else:
+                related = await run_in_threadpool(image_search.search_related_images, question + '\n' + guarded.output[:1500])
+                answer = guarded.output
+        else:
+            answer = guarded.output
+        result = payload({'question': question, 'answer': answer, 'route': 'image', 'sources': [],
+                          'related_images': related, 'security_status': 'redacted' if guarded.redactions else 'passed',
+                          'security_redactions': guarded.redactions, 'grounded': False, 'answers_question': True}, active_thread, time.perf_counter() - start)
+        record(question, result, time.perf_counter() - start, request.state.scope)
+        return result
+    except FileValidationError as exc:
+        raise HTTPException(413 if len(data) > settings.IMAGE_LIMIT else 422, str(exc)) from exc
+    except ServiceUnavailable as exc:
+        record(question, {'thread_id': active_thread, 'route': 'image'}, time.perf_counter() - started, request.state.scope, str(exc))
+        raise HTTPException(503, str(exc)) from exc
     except Exception as exc:
+        logger.exception('Image analysis failed')
+        record(question, {'thread_id': active_thread, 'route': 'image'}, time.perf_counter() - started, request.state.scope, 'Image analysis failed')
+        raise HTTPException(503, 'Image analysis is unavailable. Check the configured vision model and Google API key.') from exc
+    finally:
+        await image.close()
 
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Failed to load evaluation "
-                f"history: {exc}"
-            ),
-        )
+@api.get('/evaluation')
+def get_evaluation(request: Request):
+    tracker = EvaluationTracker(logs(request.state.scope) / 'evaluation.jsonl')
+    return {'results': [r.to_dict() for r in tracker.results], 'summary': tracker.summary()}
 
+@api.delete('/evaluation')
+def clear_evaluation(request: Request):
+    EvaluationTracker(logs(request.state.scope) / 'evaluation.jsonl').clear()
+    return {'message': 'Evaluation history cleared.'}
 
-@api.delete("/evaluation")
-def clear_evaluation() -> Dict[str, str]:
+@api.get('/observability')
+def get_observability(request: Request):
+    records = load_observability_history(logs(request.state.scope) / 'observability.jsonl')
+    return {'runs': records, 'summary': calculate_observability_summary(records)}
 
-    try:
+@api.delete('/observability')
+def clear_observability(request: Request):
+    clear_observability_history(logs(request.state.scope) / 'observability.jsonl')
+    return {'message': 'Observability history cleared.'}
 
-        tracker = EvaluationTracker()
+# Compatibility helpers used by older tests and callers; metadata still uses DB truth.
+is_harmful_request = harmful
 
-        tracker.clear()
+def build_knowledge_base_answer(question, scope=None):
+    if intent_for(question) != 'metadata':
+        return None
+    if scope is None:
+        return None  # Never fall back to a shared/global registry.
+    return {'answer': metadata_answer(question, repository.list(scope)), 'route': 'metadata'}
 
-        return {
-            "message": (
-                "Evaluation history cleared."
-            )
-        }
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Failed to clear evaluation "
-                f"history: {exc}"
-            ),
-        )
-
-
-# ============================================================================
-# OBSERVABILITY API
-# ============================================================================
-
-
-@api.get("/observability")
-async def get_observability():
-    records = load_observability_history()
-
-    return {
-        "runs": records,
-        "summary": calculate_observability_summary(
-            records
-        ),
-    }
-
-
-@api.delete("/observability")
-async def clear_observability():
-    clear_observability_history()
-
-    return {
-        "message": "Observability history cleared."
-    }
-
-
-@api.delete("/observability")
-def clear_observability() -> Dict[str, str]:
-
-    try:
-
-        clear_observability_history()
-
-        return {
-            "message": (
-                "Observability history cleared."
-            )
-        }
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Failed to clear observability "
-                f"history: {exc}"
-            ),
-        )
-
-
-# ============================================================================
-# DEVELOPMENT ENTRY POINT
-# ============================================================================
-
-
-if __name__ == "__main__":
-
+if __name__ == '__main__':
     import uvicorn
-
-    uvicorn.run(
-        "api:api",
-        host="127.0.0.1",
-        port=8000,
-        reload=True,
-    )
+    uvicorn.run('backend.api:api', host='127.0.0.1', port=8000)

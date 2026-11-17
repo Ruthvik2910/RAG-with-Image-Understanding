@@ -1,3 +1,12 @@
+# Corrected API release
+
+Start with [START_HERE.md](START_HERE.md) for the current setup and commands.
+See [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md) for the fixes, preserved files, tests, and limitations.
+The active frontend/backend use `backend.api:api` and the integration graph in `backend/orchestration.py`.
+The original graph/ingestion files below are preserved as requested; importing that legacy graph directly does not use the API fixes.
+
+---
+
 # Retrieval-Augmented Generation(RAG) with Image Understanding
 
 An AI-powered application that combines **Retrieval-Augmented Generation (RAG), agentic workflows, document intelligence, and multimodal image understanding** in a unified web application.
@@ -254,6 +263,8 @@ Create a local `.env` file using `.env.example` as your reference. For example:
 ```dotenv
 GOOGLE_API_KEY=your_google_api_key
 VISION_MODEL=gemini-3.5-flash-lite
+# Use a Gemini model that supports multimodal image inputs.
+# Invalid aliases such as gemini-3.8-flash-lite will fail at runtime.
 ```
 
 Add the other variables required by the application and its optional integrations. Use placeholder values in `.env.example` and real credentials only in your local `.env`.

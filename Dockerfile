@@ -10,6 +10,7 @@ RUN apt-get update \
         build-essential \
         curl \
         libmagic1 \
+        tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

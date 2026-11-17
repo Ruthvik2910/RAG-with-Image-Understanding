@@ -1,5 +1,7 @@
 "use client";
 
+import { apiFetch } from "@/lib/api";
+
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
@@ -61,7 +63,7 @@ const EMPTY_SUMMARY: ObservabilitySummary = {
 };
 
 function formatPercent(value: number): string {
-  return `${(Number(value) || 0).toFixed(1)}%`;
+  return `${((Number(value) || 0) * 100).toFixed(1)}%`;
 }
 
 function formatSeconds(value: number): string {
@@ -125,7 +127,7 @@ export default function ObservabilityPage() {
     try {
       setError("");
 
-      const response = await fetch(
+      const response = await apiFetch(
         `${API_URL}/observability`,
         {
           method: "GET",
@@ -160,7 +162,8 @@ export default function ObservabilityPage() {
   }, []);
 
   useEffect(() => {
-    loadObservability();
+    const start = window.setTimeout(() => { void loadObservability(); }, 0);
+    return () => window.clearTimeout(start);
   }, [loadObservability]);
 
   const handleRefresh = async () => {
@@ -173,7 +176,7 @@ export default function ObservabilityPage() {
       setClearing(true);
       setError("");
 
-      const response = await fetch(
+      const response = await apiFetch(
         `${API_URL}/observability`,
         {
           method: "DELETE",

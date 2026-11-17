@@ -1,11 +1,9 @@
 "use client";
 
+import { apiFetch, API_URL } from "@/lib/api";
+
 import { useEffect, useState } from "react";
 import Link from "next/link";
-
-const API_BASE =
-  process.env.NEXT_PUBLIC_API_URL ||
-  "http://127.0.0.1:8000";
 
 type EvaluationResult = {
   question: string;
@@ -13,10 +11,10 @@ type EvaluationResult = {
   route: string;
   retrieved_documents: number;
   relevant_documents: number;
-  grounded: boolean;
-  answers_question: boolean;
-  retry_count: number;
-  latency_seconds: number;
+  grounded: boolean | null;
+  answers_question: boolean | null;
+  retry_count: number | null;
+  latency_seconds: number | null;
   sources: Array<Record<string, unknown>>;
   timestamp: string;
   error: string;
@@ -33,6 +31,9 @@ type EvaluationSummary = {
   answer_quality_rate: number;
   average_retries: number;
   average_retrieval_relevance: number;
+  grounded_evaluated_questions: number;
+  quality_evaluated_questions: number;
+  retrieval_evaluated_questions: number;
 };
 
 type EvaluationResponse = {
@@ -44,8 +45,8 @@ function formatPercent(value: number) {
   return `${(value * 100).toFixed(1)}%`;
 }
 
-function formatLatency(value: number) {
-  return `${value.toFixed(2)}s`;
+function formatLatency(value: number | null) {
+  return value === null ? "—" : `${value.toFixed(2)}s`;
 }
 
 function formatDate(value: string) {
@@ -160,8 +161,8 @@ export default function EvaluationPage() {
       setLoading(true);
       setError("");
 
-      const response = await fetch(
-        `${API_BASE}/evaluation`,
+      const response = await apiFetch(
+        `${API_URL}/evaluation`,
         {
           cache: "no-store",
         }
@@ -201,8 +202,8 @@ export default function EvaluationPage() {
       setClearing(true);
       setError("");
 
-      const response = await fetch(
-        `${API_BASE}/evaluation`,
+      const response = await apiFetch(
+        `${API_URL}/evaluation`,
         {
           method: "DELETE",
         }
@@ -227,7 +228,8 @@ export default function EvaluationPage() {
   }
 
   useEffect(() => {
-    loadEvaluation();
+    const start = window.setTimeout(() => { void loadEvaluation(); }, 0);
+    return () => window.clearTimeout(start);
   }, []);
 
   const summary =
@@ -240,6 +242,9 @@ export default function EvaluationPage() {
       answer_quality_rate: 0,
       average_retries: 0,
       average_retrieval_relevance: 0,
+      grounded_evaluated_questions: 0,
+      quality_evaluated_questions: 0,
+      retrieval_evaluated_questions: 0,
     };
 
   return (
@@ -307,7 +312,7 @@ export default function EvaluationPage() {
         )}
 
         {/* Metrics */}
-        <section className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        {data && <section className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <MetricCard
             label="Total questions"
             value={String(
@@ -326,25 +331,19 @@ export default function EvaluationPage() {
 
           <MetricCard
             label="Grounded rate"
-            value={formatPercent(
-              summary.grounded_rate
-            )}
+            value={summary.total_questions > 0 && summary.grounded_evaluated_questions === 0 ? "—" : formatPercent(summary.grounded_rate)}
             description="Answers supported by evidence"
           />
 
           <MetricCard
             label="Answer quality"
-            value={formatPercent(
-              summary.answer_quality_rate
-            )}
+            value={summary.total_questions > 0 && summary.quality_evaluated_questions === 0 ? "—" : formatPercent(summary.answer_quality_rate)}
             description="Answers passing the quality gate"
           />
 
           <MetricCard
             label="Retrieval relevance"
-            value={formatPercent(
-              summary.average_retrieval_relevance
-            )}
+            value={summary.total_questions > 0 && summary.retrieval_evaluated_questions === 0 ? "—" : formatPercent(summary.average_retrieval_relevance)}
             description="Relevant retrieved documents"
           />
 
@@ -371,7 +370,7 @@ export default function EvaluationPage() {
             )}
             description="Requests that returned errors"
           />
-        </section>
+        </section>}
 
         {/* Evaluation explanation */}
         <section className="mt-8 grid gap-4 md:grid-cols-3">
@@ -383,7 +382,8 @@ export default function EvaluationPage() {
             <p className="mt-2 text-sm leading-6 text-slate-400">
               Measures whether the generated
               response was judged to be supported
-              by the retrieved evidence.
+              by the retrieved evidence. The rate uses assessed answers only;
+              unassessed answers show a dash.
             </p>
           </div>
 
@@ -395,7 +395,8 @@ export default function EvaluationPage() {
             <p className="mt-2 text-sm leading-6 text-slate-400">
               Tracks whether the final answer passed
               the question-answer quality gate in
-              the agentic workflow.
+              the agentic workflow. Execution success is tracked separately
+              from this assessment.
             </p>
           </div>
 
@@ -407,7 +408,7 @@ export default function EvaluationPage() {
             <p className="mt-2 text-sm leading-6 text-slate-400">
               Compares relevant retrieved documents
               against the total number of retrieved
-              documents.
+              documents, averaged over requests that actually retrieved documents.
             </p>
           </div>
         </section>
@@ -540,9 +541,7 @@ export default function EvaluationPage() {
                                     : "text-red-300"
                                 }`}
                               >
-                                {result.grounded
-                                  ? "Yes"
-                                  : "No"}
+                                {result.grounded === null ? "—" : result.grounded ? "Yes" : "No"}
                               </span>
                             </td>
 
@@ -554,9 +553,7 @@ export default function EvaluationPage() {
                                     : "text-red-300"
                                 }`}
                               >
-                                {result.answers_question
-                                  ? "Pass"
-                                  : "Fail"}
+                                {result.answers_question === null ? "—" : result.answers_question ? "Pass" : "Fail"}
                               </span>
                             </td>
 
@@ -567,7 +564,7 @@ export default function EvaluationPage() {
                             </td>
 
                             <td className="px-5 py-4 text-sm text-slate-400">
-                              {result.retry_count}
+                              {result.retry_count ?? "—"}
                             </td>
 
                             <td className="px-5 py-4">
@@ -589,7 +586,7 @@ export default function EvaluationPage() {
                   </tbody>
                 </table>
               </div>
-            ) : (
+            ) : !loading && !error && data ? (
               <div className="p-12 text-center">
                 <div className="text-sm font-medium text-slate-300">
                   No evaluations yet
@@ -607,7 +604,7 @@ export default function EvaluationPage() {
                   Ask a question
                 </Link>
               </div>
-            )}
+            ) : null}
           </div>
         </section>
       </div>
